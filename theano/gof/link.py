@@ -7,7 +7,7 @@ from copy import copy, deepcopy
 from sys import getsizeof
 import sys
 import traceback
-import numpy
+import numpy as np
 
 import theano
 from theano.compat import izip
@@ -179,7 +179,7 @@ def raise_with_op(node, thunk=None, exc_info=None, storage_map=None):
 
     # Print node backtraces
     tr = getattr(node.outputs[0].tag, 'trace', [])
-    if type(tr) is list and len(tr) > 0:
+    if isinstance(tr, list) and len(tr) > 0:
         detailed_err_msg += "\nBacktrace when the node is created(use Theano flag traceback.limit=N to make it longer):\n"
 
         # Print separate message for each element in the list of batcktraces
@@ -236,11 +236,11 @@ def raise_with_op(node, thunk=None, exc_info=None, storage_map=None):
             # storage_map_item[3]: bytes
             if hasattr(storage_map[k][0], 'dtype'):
                 dtype = storage_map[k][0].dtype
-                storage_map_item.append(numpy.dtype(dtype).itemsize)
+                storage_map_item.append(np.dtype(dtype).itemsize)
                 if shapeinfo is None:
                     storage_map_item.append(-1)
                 else:
-                    sz = numpy.dtype(dtype).itemsize * numpy.prod(shapeinfo)
+                    sz = np.dtype(dtype).itemsize * np.prod(shapeinfo)
                     storage_map_item.append(sz)
                     total_size += sz
                     if not k.owner:
@@ -762,7 +762,7 @@ class PerformLinker(LocalLinker):
         if schedule:
             self.schedule = schedule
 
-    def accept(self, fgraph, no_recycling=None):
+    def accept(self, fgraph, no_recycling=None, profile=None):
         """
 
         Parameters
@@ -781,7 +781,8 @@ class PerformLinker(LocalLinker):
         if no_recycling is None:
             no_recycling = []
         if self.fgraph is not None and self.fgraph is not fgraph:
-            return type(self)(allow_gc=self.allow_gc).accept(fgraph, no_recycling)
+            return type(self)(allow_gc=self.allow_gc).accept(
+                fgraph, no_recycling, profile)
             # raise Exception("Cannot accept from a Linker that is already tied to another FunctionGraph.")
         self.fgraph = fgraph
         self.no_recycling = no_recycling
@@ -822,17 +823,13 @@ class PerformLinker(LocalLinker):
             # the python version
             # Note : ops that implement their own make thunk don't usually
             # have this attribute defiend !!
-            old_value = getattr(node.op, '_op_use_c_code', False)
-            try:
-                node.op._op_use_c_code = False
-                thunks += [node.op.make_thunk(node,
-                                              storage_map,
-                                              compute_map,
-                                              no_recycling)]
-                thunks[-1].inputs = [storage_map[v] for v in node.inputs]
-                thunks[-1].outputs = [storage_map[v] for v in node.outputs]
-            finally:
-                node.op._op_use_c_code = old_value
+            thunks += [node.op.make_thunk(node,
+                                          storage_map,
+                                          compute_map,
+                                          no_recycling,
+                                          'py')]
+            thunks[-1].inputs = [storage_map[v] for v in node.inputs]
+            thunks[-1].outputs = [storage_map[v] for v in node.outputs]
 
         computed, last_user = gc_helper(order)
         if self.allow_gc:
@@ -944,7 +941,7 @@ class WrapLinker(Linker):
             linkers=[l.clone(allow_gc=allow_gc) for l in self.linkers],
             wrapper=self.wrapper)
 
-    def accept(self, fgraph, no_recycling=None):
+    def accept(self, fgraph, no_recycling=None, profile=None):
         """
 
         Parameters

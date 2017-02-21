@@ -1,4 +1,5 @@
 from __future__ import absolute_import, print_function, division
+import collections
 import copy
 import traceback as tb
 import warnings
@@ -87,16 +88,7 @@ class _tensor_py_operators(object):
             return True
         else:
             raise TypeError(
-                "Variables do not support boolean operations. This "
-                "can happen if you do a logical operation (<, <=, >, <=, "
-                "==, !=) between a numpy.ndarray and a Theano tensor"
-                "variable. Due to NumPy implementation before NumPy 1.8, "
-                "we cannot make the Python syntax work when the ndarray "
-                "is on the left, and this results in this error. To work "
-                "around that, either call "
-                "theano.tensor.{lt,le,eq,ne,gt,ge}(ndarray, tensor), or "
-                "use the Python syntax with the Theano tensor on the "
-                "left. Or update to NumPy 1.8 or above."
+                "Variables do not support boolean operations."
             )
 
     # BITWISE
@@ -313,6 +305,7 @@ class _tensor_py_operators(object):
             The length of the shape. Passing None here means for
             Theano to try and guess the length of `shape`.
 
+
         .. warning:: This has a different signature than numpy's
                      ndarray.reshape!
                      In numpy you do not need to wrap the shape arguments
@@ -466,11 +459,52 @@ class _tensor_py_operators(object):
 
     # SLICING/INDEXING
     def __getitem__(self, args):
+
+        def check_bool(args_el):
+            try:
+                if (isinstance(args_el, (numpy.bool_, bool)) or
+                        args_el.dtype == 'bool'):
+                    raise TypeError('TensorType does not support boolean '
+                                    'mask for indexing such as tensor[x==0]. '
+                                    'Instead you can use non_zeros() such as '
+                                    'tensor[(x == 0).nonzeros()]. ')
+            except AttributeError:
+                pass
+
+            if (not isinstance(args_el, theano.tensor.Variable) and
+                    isinstance(args_el, collections.Iterable)):
+                for el in args_el:
+                    check_bool(el)
+
+        check_bool(args)
+
         if (isinstance(args, list) and
                 any([isinstance(a, slice) for a in args])):
             pass
         elif not isinstance(args, tuple):
             args = args,
+
+        # Convert an Ellipsis if provided into an appropriate number of
+        # slice(None).
+        ellipses = [i
+                    for i, index in enumerate(args)
+                    if index is Ellipsis]
+        if len(ellipses) > 1:
+            raise IndexError(
+                "an index can only have a single Ellipsis (`...`)")
+        elif len(ellipses) == 1:
+            new_axes = sum(1
+                           for index in args
+                           if index is numpy.newaxis)  # numpy.newaxis is None
+            ellipsis_at = ellipses[0]
+            args = list(args)
+            args[ellipsis_at: ellipsis_at + 1] = (
+                [slice(None)] * (self.ndim - (len(args) - 1 - new_axes)))
+
+        # Force input to be int64 datatype if input is an empty list or tuple
+        # Else leave it as is if it is a real number
+        args = tuple([numpy.array(inp, dtype=numpy.int64)
+                      if(inp == [] or inp == ()) else inp for inp in args])
         # Convert python literals to theano constants
         args = theano.tensor.subtensor.make_constant(args)
         # Determine if advanced indexing is needed or not
@@ -625,13 +659,15 @@ class _tensor_py_operators(object):
                                         dtype=dtype, keepdims=keepdims,
                                         acc_dtype=acc_dtype)
 
-    def var(self, axis=None, keepdims=False):
+    def var(self, axis=None, ddof=0, keepdims=False, corrected=False):
         """See `theano.tensor.var`."""
-        return theano.tensor.basic.var(self, axis, keepdims=keepdims)
+        return theano.tensor.basic.var(self, axis=axis, ddof=ddof,
+                                       keepdims=keepdims, corrected=corrected)
 
-    def std(self, axis=None, keepdims=False):
+    def std(self, axis=None, ddof=0, keepdims=False, corrected=False):
         """See `theano.tensor.std`."""
-        return theano.tensor.basic.std(self, axis, keepdims=keepdims)
+        return theano.tensor.basic.std(self, axis=axis, ddof=ddof,
+                                       keepdims=keepdims, corrected=corrected)
 
     def min(self, axis=None, keepdims=False):
         """See `theano.tensor.min`."""
@@ -679,7 +715,7 @@ class _tensor_py_operators(object):
         """See `theano.tensor.repeat`."""
         return theano.tensor.extra_ops.repeat(self, repeats, axis)
 
-    def round(self, mode="half_away_from_zero"):
+    def round(self, mode=None):
         """See `theano.tensor.round`."""
         return theano.tensor.basic.round(self, mode)
 
@@ -694,6 +730,9 @@ class _tensor_py_operators(object):
 
     def zeros_like(model, dtype=None):
         return theano.tensor.basic.zeros_like(model, dtype=dtype)
+
+    def ones_like(model, dtype=None):
+        return theano.tensor.basic.ones_like(model, dtype=dtype)
 
     def cumsum(self, axis=None):
         return theano.tensor.extra_ops.cumsum(self, axis)

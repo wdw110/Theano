@@ -297,9 +297,6 @@ class Ger(Op):
     This interface to GER allows non-destructive operation on A via the
     `destructive` argument to the constructor.
 
-    :TODO: Create better classes ScipyGer and CGer that inherit from this class
-    and override the make_thunk() method to use Scipy and C respectively.
-
     """
 
     __props__ = ("destructive",)
@@ -423,7 +420,7 @@ def _ldflags(ldflags_str, libs, flags, libs_dir, include_dir):
         l = _ldflags(ldflags_str=ldflags_str, libs=True,
                      flags=False, libs_dir=False, include_dir=False)
         for d in dirs:
-            for f in os.listdir(d):
+            for f in os.listdir(d.strip('"')):
                 if (f.endswith('.so') or f.endswith('.dylib') or
                         f.endswith('.dll')):
                     if any([f.find(ll) >= 0 for ll in l]):
@@ -436,10 +433,8 @@ def _ldflags(ldflags_str, libs, flags, libs_dir, include_dir):
 
     for t in ldflags_str.split():
         # Remove extra quote.
-        if t.startswith("'") or t.startswith('"'):
-            t = t[1:]
-        if t.endswith("'") or t.endswith('"'):
-            t = t[:-1]
+        if (t.startswith("'") and t.endswith("'")) or (t.startswith('"') and t.endswith('"')):
+            t = t[1:-1]
 
         try:
             t0, t1, t2 = t[0:3]
@@ -837,10 +832,8 @@ class Gemm(GemmRelated):
         else:
             self.setup_z_Nz_Sz = self.setup_z_Nz_Sz_outplace
 
-        # Correctly reload older pickles where _op_use_c_code and
-        # destroy_map were not saved
-        if '_op_use_c_code' not in self.__dict__:
-            self._op_use_c_code = theano.config.cxx
+        # Correctly reload older pickles where destroy_map were not
+        # saved
         if 'destroy_map' not in self.__dict__ and self.inplace:
             self.destroy_map = {0: [0]}
 
@@ -1042,10 +1035,6 @@ class Gemm(GemmRelated):
         if node.inputs[0].type.dtype.startswith('complex'):
             raise utils.MethodNotDefined('%s.c_code'
                                          % self.__class__.__name__)
-        if not config.blas.ldflags:
-            return super(Gemm, self).c_code(node, name,
-                                            (_z, _a, _x, _y, _b), (_zout, ),
-                                            sub)
         full_code = self.build_gemm_call() % dict(locals(), **sub)
         return full_code
 
@@ -1087,7 +1076,7 @@ def _as_scalar(res, dtype=None):
             rval = res.dimshuffle()
         else:
             rval = res
-        if rval.type.dtype[:3] in ('int', 'uin'):
+        if rval.type.dtype in theano.tensor.integer_dtypes:
             # We check that the upcast of res and dtype won't change dtype.
             # If dtype is float64, we will cast int64 to float64.
             # This is valid when res is a scalar used as input to a dot22
@@ -1102,14 +1091,14 @@ def _as_scalar(res, dtype=None):
 
 
 def _is_real_matrix(res):
-    return (res.type.dtype in ('float32', 'float64') and
+    return (res.type.dtype in ('float16', 'float32', 'float64') and
             res.type.ndim == 2 and
             res.type.broadcastable[0] is False and
             res.type.broadcastable[1] is False)  # cope with tuple vs. list
 
 
 def _is_real_vector(res):
-    return (res.type.dtype in ('float32', 'float64') and
+    return (res.type.dtype in ('float16', 'float32', 'float64') and
             res.type.ndim == 1 and
             res.type.broadcastable[0] is False)
 
@@ -1194,7 +1183,7 @@ def _gemm_canonicalize(r, scale, rval, maxclients):
     def scaled(thing):
         if scale == 1:
             return thing
-        if scale == -1:
+        if scale == -1 and thing.type.dtype != 'bool':
             return -thing
         else:
             return scale * thing
@@ -1204,7 +1193,7 @@ def _gemm_canonicalize(r, scale, rval, maxclients):
         return None
 
     if ((r.type.ndim not in (1, 2)) or
-            r.type.dtype not in ('float32', 'float64',
+            r.type.dtype not in ('float16', 'float32', 'float64',
                                  'complex64', 'complex128')):
         rval.append(scaled(r))
         return rval
@@ -1537,7 +1526,7 @@ class Dot22(GemmRelated):
     """
 
     def make_node(self, x, y):
-        dtypes = ('float32', 'float64', 'complex64', 'complex128')
+        dtypes = ('float16', 'float32', 'float64', 'complex64', 'complex128')
         if x.type.ndim != 2 or x.type.dtype not in dtypes:
             raise TypeError(x)
         if y.type.ndim != 2 or y.type.dtype not in dtypes:
@@ -1630,7 +1619,7 @@ def local_dot_to_dot22(node):
                      x, y, x.type, y.type)
         return
 
-    if y.type.dtype in ['float32', 'float64', 'complex64', 'complex128']:
+    if y.type.dtype in ['float16', 'float32', 'float64', 'complex64', 'complex128']:
         if x.ndim == 2 and y.ndim == 2:
             # print "local_dot_to_dot22: MM"
             return [_dot22(*node.inputs)]
@@ -2159,18 +2148,16 @@ class BatchedDot(Op):
         _z, = out
         fail = sub["fail"]
 
-        if not config.blas.ldflags:
-            return super(BatchedDot, self).c_code(node, name,
-                                                  inp, out, sub)
-
         # generate contiguity condition
         def contiguous(var, ndim):
             strides = "PyArray_STRIDES(%s)" % var
+            if ndim == 1:
+                return "{strides}[0] == type_size".format(strides=strides)
             return " && ".join([
                 " && ".join("{strides}[{i}] > 0 && {strides}[{i}] % type_size == 0"
-                            .format(strides=strides, i=i) for i in range(ndim)),
+                            .format(strides=strides, i=i) for i in range(1, ndim)),
                 "(%s)" % " || ".join("{strides}[{i}] == type_size"
-                                     .format(strides=strides, i=i) for i in range(ndim)),
+                                     .format(strides=strides, i=i) for i in range(1, ndim)),
             ])
 
         x_ndim, y_ndim, z_ndim = node.inputs[0].ndim, node.inputs[1].ndim, node.outputs[0].ndim
@@ -2324,7 +2311,7 @@ class BatchedDot(Op):
 
     def c_code_cache_version(self):
         from theano.tensor.blas_headers import blas_header_version
-        return (1, blas_header_version())
+        return (3, blas_header_version())
 
     def grad(self, inp, grads):
         x, y = inp

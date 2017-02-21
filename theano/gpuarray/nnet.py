@@ -1,5 +1,6 @@
 from __future__ import absolute_import, print_function, division
-import numpy
+import os
+import numpy as np
 
 from theano import Op, Apply, config
 from six import StringIO
@@ -45,7 +46,10 @@ class GpuCrossentropySoftmaxArgmax1HotWithBias(GpuKernelBase, Op):
         return node.inputs[0].type.context
 
     def c_headers(self):
-        return ['<numpy_compat.h>', '<gpuarray/types.h>']
+        return ['<numpy_compat.h>', '<gpuarray/types.h>', 'gpuarray_helper.h']
+
+    def c_header_dirs(self):
+        return [os.path.dirname(__file__)]
 
     def gpu_kernels(self, node, nodename):
         dtype_x = node.inputs[0].dtype
@@ -191,25 +195,15 @@ class GpuCrossentropySoftmaxArgmax1HotWithBias(GpuKernelBase, Op):
     def c_code(self, node, nodename, inp, out, sub):
         if node.inputs[0].type.context.kind != b'cuda':
             raise NotImplementedError('cuda only')
-        typecode_x = pygpu.gpuarray.dtype_to_typecode(node.inputs[0].dtype)
-        typecode_b = pygpu.gpuarray.dtype_to_typecode(node.inputs[1].dtype)
-        typecode_y_idx = pygpu.gpuarray.dtype_to_typecode(node.inputs[2].dtype)
-        itemsize_x = numpy.dtype(node.inputs[0].dtype).itemsize
-        worksize_x = numpy.dtype(work_dtype(node.inputs[0].dtype)).itemsize
-        itemsize_b = numpy.dtype(node.inputs[1].dtype).itemsize
-        itemsize_y_idx = numpy.dtype(node.inputs[2].dtype).itemsize
-        itemsize_nll = numpy.dtype(node.outputs[0].dtype).itemsize
-        itemsize_sm = numpy.dtype(node.outputs[1].dtype).itemsize
-        itemsize_am = numpy.dtype(node.outputs[2].dtype).itemsize
+        itemsize_x = np.dtype(node.inputs[0].dtype).itemsize
+        worksize_x = np.dtype(work_dtype(node.inputs[0].dtype)).itemsize
+        itemsize_b = np.dtype(node.inputs[1].dtype).itemsize
+        itemsize_y_idx = np.dtype(node.inputs[2].dtype).itemsize
+        itemsize_nll = np.dtype(node.outputs[0].dtype).itemsize
+        itemsize_sm = np.dtype(node.outputs[1].dtype).itemsize
+        itemsize_am = np.dtype(node.outputs[2].dtype).itemsize
         x, b, y_idx = inp
         nll, sm, am = out
-        dtype_x = node.inputs[0].dtype
-        dtype_b = node.inputs[1].dtype
-        dtype_y_idx = node.inputs[2].dtype
-        dtype_nll = node.outputs[0].dtype
-        dtype_sm = node.outputs[1].dtype
-        dtype_am = node.outputs[2].dtype
-        classname = self.__class__.__name__
         fail = sub['fail']
         ctx = sub['params']
         k_var = "k_xent_sm_1hot_bias_%(nodename)s" % locals()
@@ -229,21 +223,6 @@ class GpuCrossentropySoftmaxArgmax1HotWithBias(GpuKernelBase, Op):
             """ % locals()
         sio = StringIO()
         print("""
-        if (PyGpuArray_NDIM(%(y_idx)s) != 1)
-        {
-            PyErr_SetString(PyExc_ValueError, "y_idx not 1d tensor");
-            %(fail)s;
-        }
-        if (PyGpuArray_NDIM(%(x)s) != 2)
-        {
-            PyErr_SetString(PyExc_ValueError, "x not 2d tensor");
-            %(fail)s;
-        }
-        if (PyGpuArray_NDIM(%(b)s) != 1)
-        {
-            PyErr_SetString(PyExc_ValueError, "b not 1d tensor");
-            %(fail)s;
-        }
         if (PyGpuArray_DIMS(%(x)s)[0] !=
             PyGpuArray_DIMS(%(y_idx)s)[0])
         {
@@ -257,82 +236,32 @@ class GpuCrossentropySoftmaxArgmax1HotWithBias(GpuKernelBase, Op):
                             "dimension mismatch in x,b arguments");
             %(fail)s;
         }
-        if ((NULL == %(nll)s) //initial condition
-            || (PyGpuArray_DIMS(%(nll)s)[0] !=
-                PyGpuArray_DIMS(%(y_idx)s)[0]))
-        {
-            Py_XDECREF(%(nll)s);
-            %(nll)s = pygpu_empty(1, PyGpuArray_DIMS(%(y_idx)s),
-                                %(typecode_x)s, GA_C_ORDER, %(ctx)s,
-                                Py_None);
-            if (!%(nll)s) {
-                %(fail)s
-            }
-        }
-        if ((NULL == %(sm)s)
-            || (PyGpuArray_DIMS(%(sm)s)[0] !=
-                PyGpuArray_DIMS(%(x)s)[0])
-            || (PyGpuArray_DIMS(%(sm)s)[1] !=
-                PyGpuArray_DIMS(%(x)s)[1]))
-        {
-            Py_XDECREF(%(sm)s);
-            %(sm)s = pygpu_empty(2, PyGpuArray_DIMS(%(x)s),
-                                %(typecode_b)s, GA_C_ORDER,
-                                %(ctx)s, Py_None);
-            if(!%(sm)s)
-            {
-                PyErr_SetString(PyExc_MemoryError,
-                                "failed to alloc sm output");
-                // no need to decref cnda_nll, the cleanup code should do it up
-                %(fail)s;
-            }
-        }
-        if ((NULL == %(am)s)
-            || (PyGpuArray_DIMS(%(am)s)[0] !=
-                PyGpuArray_DIMS(%(y_idx)s)[0]))
-        {
-            Py_XDECREF(%(am)s);
-            %(am)s = pygpu_empty(1, PyGpuArray_DIMS(%(y_idx)s),
-                                %(typecode_y_idx)s, GA_C_ORDER,
-                                %(ctx)s, Py_None);
-            if(!%(am)s)
-            {
-                PyErr_SetString(PyExc_MemoryError,
-                                "failed to alloc am output");
-                // no need to decref nll and sm,
-                // the cleanup code should do it up
-                %(fail)s;
-            }
-        }
+        if (theano_prep_output(&%(nll)s, 1, PyGpuArray_DIMS(%(y_idx)s), %(x)s->ga.typecode, GA_C_ORDER, %(ctx)s)) %(fail)s
+        if (theano_prep_output(&%(sm)s, 2, PyGpuArray_DIMS(%(x)s), %(x)s->ga.typecode, GA_C_ORDER, %(ctx)s)) %(fail)s
+        if (theano_prep_output(&%(am)s, 1, PyGpuArray_DIMS(%(y_idx)s), %(y_idx)s->ga.typecode, GA_C_ORDER, %(ctx)s)) %(fail)s
         {
             size_t n_blocks = std::min(PyGpuArray_DIM(%(x)s, 0), (size_t)4096);
             size_t n_threads = std::min(PyGpuArray_DIM(%(x)s, 1), (size_t)256);
             size_t n_shared = n_threads * %(worksize_x)s;
-            ssize_t stride_X0 = PyGpuArray_STRIDES(%(x)s)[0] / %(itemsize_x)s;
-            ssize_t stride_X1 = PyGpuArray_STRIDES(%(x)s)[1] / %(itemsize_x)s;
-            ssize_t stride_B0 = PyGpuArray_STRIDES(%(b)s)[0] / %(itemsize_b)s;
-            ssize_t stride_YIDX0 = PyGpuArray_STRIDES(%(y_idx)s)[0] / %(itemsize_y_idx)s;
-            ssize_t stride_NLL0 = PyGpuArray_STRIDES(%(nll)s)[0] / %(itemsize_nll)s;
-            ssize_t stride_SM0 = PyGpuArray_STRIDES(%(sm)s)[0] / %(itemsize_sm)s;
-            ssize_t stride_SM1 = PyGpuArray_STRIDES(%(sm)s)[1] / %(itemsize_sm)s;
-            ssize_t stride_AM0 = PyGpuArray_STRIDES(%(am)s)[0] / %(itemsize_am)s;
      //TODO: launch more threads per row and do parallel sum and max reductions
-            void *kernel_params[] = {
-                (void *)&PyGpuArray_DIMS(%(x)s)[0],
-                (void *)&PyGpuArray_DIMS(%(x)s)[1],
-                (void *)%(x)s->ga.data, (void *)&%(x)s->ga.offset,
-                (void *)&stride_X0, (void *)&stride_X1,
-                (void *)%(b)s->ga.data, (void *)&%(b)s->ga.offset,
-                (void *)&stride_B0,
-                (void *)%(y_idx)s->ga.data, (void *)&%(y_idx)s->ga.offset,
-                (void *)&stride_YIDX0,
-                (void *)%(nll)s->ga.data, (void *)&%(nll)s->ga.offset,
-                (void *)&stride_NLL0,
-                (void *)%(sm)s->ga.data, (void *)&%(sm)s->ga.offset,
-                (void *)&stride_SM0, (void *)&stride_SM1,
-                (void *)%(am)s->ga.data, (void *)&%(am)s->ga.offset,
-                (void *)&stride_AM0};
-            int err = GpuKernel_call(&%(k_var)s, 1, &n_threads, &n_blocks, n_shared, kernel_params);
+            int err = k_xent_sm_1hot_bias_call(
+                1, &n_blocks, &n_threads, n_shared,
+                PyGpuArray_DIMS(%(x)s)[0],
+                PyGpuArray_DIMS(%(x)s)[1],
+                %(x)s->ga.data, %(x)s->ga.offset,
+                PyGpuArray_STRIDE(%(x)s, 0) / %(itemsize_x)s,
+                PyGpuArray_STRIDE(%(x)s, 1) / %(itemsize_x)s,
+                %(b)s->ga.data, %(b)s->ga.offset,
+                PyGpuArray_STRIDE(%(b)s, 0) / %(itemsize_b)s,
+                %(y_idx)s->ga.data, %(y_idx)s->ga.offset,
+                PyGpuArray_STRIDE(%(y_idx)s, 0) / %(itemsize_y_idx)s,
+                %(nll)s->ga.data, %(nll)s->ga.offset,
+                PyGpuArray_STRIDE(%(nll)s, 0) / %(itemsize_nll)s,
+                %(sm)s->ga.data, %(sm)s->ga.offset,
+                PyGpuArray_STRIDE(%(sm)s, 0) / %(itemsize_sm)s,
+                PyGpuArray_STRIDE(%(sm)s, 1) / %(itemsize_sm)s,
+                %(am)s->ga.data, %(am)s->ga.offset,
+                PyGpuArray_STRIDE(%(am)s, 0) / %(itemsize_am)s);
             %(err_check)s
             %(sync)s
         }
@@ -340,7 +269,7 @@ class GpuCrossentropySoftmaxArgmax1HotWithBias(GpuKernelBase, Op):
         return sio.getvalue()
 
     def c_code_cache_version(self):
-        return (10,)
+        return (12,)
 
 
 gpu_crossentropy_softmax_argmax_1hot_with_bias = GpuCrossentropySoftmaxArgmax1HotWithBias()
@@ -369,7 +298,7 @@ class GpuCrossentropySoftmax1HotWithBiasDx(GpuKernelBase, Op):
         return node.inputs[0].type.context
 
     def c_code_cache_version(self):
-        return (11,)
+        return (12,)
 
     def c_headers(self):
         return ['<numpy_compat.h>', '<gpuarray/types.h>']
@@ -378,15 +307,15 @@ class GpuCrossentropySoftmax1HotWithBiasDx(GpuKernelBase, Op):
         if node.inputs[0].type.context.kind != b'cuda':
             raise NotImplementedError("cuda only")
         typecode_dx = pygpu.gpuarray.dtype_to_typecode(node.outputs[0].dtype)
-        itemsize_dnll = numpy.dtype(node.inputs[0].dtype).itemsize
-        itemsize_sm = numpy.dtype(node.inputs[1].dtype).itemsize
-        itemsize_y_idx = numpy.dtype(node.inputs[2].dtype).itemsize
-        itemsize_dx = numpy.dtype(node.outputs[0].dtype).itemsize
+        itemsize_dnll = np.dtype(node.inputs[0].dtype).itemsize
+        itemsize_sm = np.dtype(node.inputs[1].dtype).itemsize
+        itemsize_y_idx = np.dtype(node.inputs[2].dtype).itemsize
+        itemsize_dx = np.dtype(node.outputs[0].dtype).itemsize
         dtype_dnll = node.inputs[0].dtype
         dtype_sm = node.inputs[1].dtype
         dtype_y_idx = node.inputs[2].dtype
         dtype_dx = node.outputs[0].dtype
-        type_intp = gpuarray.dtype_to_ctype(numpy.intp)
+        type_intp = gpuarray.dtype_to_ctype(np.intp)
         dnll, sm, y_idx = inp
         dx, = out
         fail = sub['fail']
@@ -482,7 +411,7 @@ class GpuCrossentropySoftmax1HotWithBiasDx(GpuKernelBase, Op):
                 (void *)&stride_YIDX0,
                 (void *)%(dx)s->ga.data, (void *)&%(dx)s->ga.offset,
                 (void *)&stride_DX0, (void *)&stride_DX1};
-            int err = GpuKernel_call(&%(k_var)s, 3, threads_per_block, n_blocks, 0, kernel_params);
+            int err = GpuKernel_call(&%(k_var)s, 3, n_blocks, threads_per_block, 0, kernel_params);
             %(err_check)s
             %(sync)s
         }
@@ -499,7 +428,8 @@ class GpuCrossentropySoftmax1HotWithBiasDx(GpuKernelBase, Op):
         load_sm = load_w(dtype_sm)
         write_dx = write_w(dtype_dx)
         flags = Kernel.get_flags(dtype_dnll, dtype_sm, dtype_y_idx, dtype_dx)
-        type_dnll = gpuarray.dtype_to_ctype(work_dnll)
+        wtype_dnll = gpuarray.dtype_to_ctype(work_dnll)
+        type_dnll = gpuarray.dtype_to_ctype(dtype_dnll)
         type_sm = gpuarray.dtype_to_ctype(dtype_sm)
         type_y_idx = gpuarray.dtype_to_ctype(dtype_y_idx)
         type_dx = gpuarray.dtype_to_ctype(dtype_dx)
@@ -525,7 +455,7 @@ class GpuCrossentropySoftmax1HotWithBiasDx(GpuKernelBase, Op):
 
             for (int i = blockIdx.x; i < N; i += gridDim.x)
             {
-                %(type_dnll)s dnll_i = %(load_dnll)s(dnll[i * dnll_s0]);
+                %(wtype_dnll)s dnll_i = %(load_dnll)s(dnll[i * dnll_s0]);
                 %(type_y_idx)s y_i = y_idx[i * y_idx_s0];
 
                 for (int j = threadIdx.x; j < K; j += blockDim.x)
@@ -589,8 +519,8 @@ class GpuSoftmax(GpuKernelBase, Op):
         dtype_x = node.inputs[0].dtype
         work_x = work_dtype(dtype_x)
         dtype_z = node.outputs[0].dtype
-        itemsize_x = numpy.dtype(dtype_x).itemsize
-        itemsize_z = numpy.dtype(dtype_z).itemsize
+        itemsize_x = np.dtype(dtype_x).itemsize
+        itemsize_z = np.dtype(dtype_z).itemsize
         typecode = pygpu.gpuarray.dtype_to_typecode(node.outputs[0].dtype)
         x, = inp
         z, = out
@@ -657,13 +587,13 @@ class GpuSoftmax(GpuKernelBase, Op):
               //TODO: read the information from the card.
               if(shmem_sz < (32 * 1024 - 500)){
                 err = GpuKernel_call(&kSoftmax_%(nodename)s, 3,
-                                     threads_per_block, n_blocks, shmem_sz,
+                                     n_blocks, threads_per_block, shmem_sz,
                                      kernel_params);
                 fmt_str = "gpuarray error: kSoftmax_%(nodename)s: %%s";
                 msg = GpuKernel_error(&kSoftmax_%(nodename)s, err);
               }else{
                 err = GpuKernel_call(&kSoftmax_fixed_shared%(nodename)s, 3,
-                                     threads_per_block, n_blocks,
+                                     n_blocks, threads_per_block,
                                      threads_per_block[0] * sizeof(npy_%(work_x)s),
                                      kernel_params);
                 fmt_str = "gpuarray error: kSoftmax_fixed_shared%(nodename)s: %%s";
@@ -789,9 +719,9 @@ class GpuSoftmaxWithBias(GpuKernelBase, Op):
         dtype_b = node.inputs[1].dtype
         dtype_z = node.outputs[0].dtype
         work_x = work_dtype(dtype_x)
-        itemsize_x = numpy.dtype(dtype_x).itemsize
-        itemsize_b = numpy.dtype(dtype_b).itemsize
-        itemsize_z = numpy.dtype(dtype_z).itemsize
+        itemsize_x = np.dtype(dtype_x).itemsize
+        itemsize_b = np.dtype(dtype_b).itemsize
+        itemsize_z = np.dtype(dtype_z).itemsize
         typecode = pygpu.gpuarray.dtype_to_typecode(node.outputs[0].dtype)
         x, b = inp
         z, = out
@@ -871,13 +801,13 @@ class GpuSoftmaxWithBias(GpuKernelBase, Op):
             {
               if(shmem_sz < (32 * 1024 - 500)){
                 err = GpuKernel_call(&kSoftmaxWithBias_%(nodename)s, 3,
-                                     threads_per_block, n_blocks, shmem_sz,
+                                     n_blocks, threads_per_block, shmem_sz,
                                      kernel_params);
                 fmt_str = "gpuarray error: kSoftmaxWithBias_%(nodename)s: %%s";
                 msg = GpuKernel_error(&kSoftmaxWithBias_%(nodename)s, err);
               }else{
                 err = GpuKernel_call(&kSoftmaxWithBias_fixed_shared%(nodename)s,
-                                     3, threads_per_block, n_blocks,
+                                     3, n_blocks, threads_per_block,
                                      threads_per_block[0] * sizeof(npy_%(work_x)s),
                                      kernel_params);
                 fmt_str = "gpuarray error: kSoftmaxWithBias_fixed_shared%(nodename)s: %%s";

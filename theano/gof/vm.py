@@ -332,7 +332,8 @@ class Stack(VM):
 
     def __init__(self, nodes, thunks, pre_call_clear,
                  storage_map, compute_map, fgraph, allow_gc,
-                 dependencies=None, callback=None, callback_input=None):
+                 n_updates, dependencies=None, callback=None,
+                 callback_input=None):
         super(Stack, self).__init__(nodes, thunks, pre_call_clear)
 
         self.allow_gc = allow_gc
@@ -346,6 +347,7 @@ class Stack(VM):
         self.node_idx = node_idx = {}
         self.callback = callback
         self.callback_input = callback_input
+        self.n_updates = n_updates
 
         ords = fgraph.orderings()
 
@@ -417,6 +419,9 @@ class Stack(VM):
 
         # apply_stack contains nodes
         if output_subset is not None:
+            first_updated = len(self.outputs) - self.n_updates
+            output_subset = output_subset + list(range(first_updated,
+                                                       len(self.outputs)))
             apply_stack =\
                 [self.outputs[i].owner for i in output_subset
                     if self.outputs[i].owner]
@@ -425,7 +430,7 @@ class Stack(VM):
 
         last_apply_stack_len = -1
 
-        # This record all function inputs/shared varibles and constants
+        # This record all function inputs/shared variables and constants
         for var, data in iteritems(self.storage_map):
             if data[0] is None:
                 continue
@@ -477,7 +482,7 @@ class Stack(VM):
                     try:
                         _, dt = self.run_thunk_of_node(current_apply)
                         del _
-                        if config.profile:
+                        if config.profile or config.print_global_stats:
                             current_idx = self.node_idx[current_apply]
                             self.call_counts[current_idx] += 1
                             self.call_times[current_idx] += dt
@@ -591,7 +596,7 @@ class Stack(VM):
                         if current_apply.inputs[r].owner:
                             apply_stack.append(current_apply.inputs[r].owner)
                 else:
-                    if config.profile:
+                    if config.profile or config.print_global_stats:
                         for (idx, o) in enumerate(thunks[
                                 self.node_idx[current_apply]].outputs):
                             var = self.nodes[
@@ -651,6 +656,10 @@ class Stack(VM):
 
 
 try:
+    # If cxx is explicitely set to an empty string, we do not want to import neither lazylinker C code
+    # nor lazylinker compiled C code from cache.
+    if not theano.config.cxx:
+        raise theano.gof.cmodule.MissingGXX('lazylinker will not be imported if theano.config.cxx is not set.')
     from . import lazylinker_c
 
     class CVM(lazylinker_c.CLazyLinker, VM):
@@ -720,13 +729,15 @@ class VM_Linker(link.LocalLinker):
         self.callback = callback
         self.callback_input = callback_input
         self.lazy = lazy
+        if c_thunks is None:
+            c_thunks = bool(theano.config.cxx)
         self.c_thunks = c_thunks
         self.allow_partial_eval = allow_partial_eval
         self.updated_vars = {}
         if schedule:
             self.schedule = schedule
 
-    def accept(self, fgraph, no_recycling=None):
+    def accept(self, fgraph, no_recycling=None, profile=None):
         """
         Check if fgraph is the first FunctionGraph that has ever been
         associated to self, else, create a new VM_Linker
@@ -746,10 +757,12 @@ class VM_Linker(link.LocalLinker):
         associated to self, else, a new VM_Linker associated to fgraph.
 
         """
-        if (config.profile and
-                hasattr(theano, 'sandbox') and
-                hasattr(theano.sandbox, 'cuda') and
-                theano.sandbox.cuda.cuda_enabled):
+        if ((config.profile or config.print_global_stats) and
+                ((hasattr(theano, 'sandbox') and
+                  hasattr(theano.sandbox, 'cuda') and
+                  theano.sandbox.cuda.cuda_enabled) or
+                 (hasattr(theano, 'gpuarray') and
+                  theano.gpuarray.pygpu_activated))):
             if os.environ.get('CUDA_LAUNCH_BLOCKING', '0') != '1':
                 raise Exception(
                     "You are running the Theano profiler with CUDA enabled."
@@ -774,9 +787,11 @@ class VM_Linker(link.LocalLinker):
                 schedule=self.schedule,
                 c_thunks=self.c_thunks,
                 allow_partial_eval=self.allow_partial_eval
-            ).accept(fgraph, no_recycling)
+            ).accept(fgraph, no_recycling, profile)
         self.fgraph = fgraph
         self.no_recycling = no_recycling
+        self.profile = profile
+
         return self
 
     def accept_var_updates(self, updated_vars):
@@ -841,8 +856,8 @@ class VM_Linker(link.LocalLinker):
         pre_call_clear = [storage_map[v] for v in self.no_recycling]
 
         if (self.callback is not None or self.callback_input is not None or
-                (config.profile and config.profile_memory) or
-                self.allow_partial_eval):
+                ((config.profile or config.print_global_stats) and config.profile_memory) or
+                (self.allow_partial_eval and not self.use_cloop)):
 
             if self.use_cloop and (self.callback is not None or
                                    self.callback_input is not None):
@@ -850,9 +865,9 @@ class VM_Linker(link.LocalLinker):
             if self.use_cloop and config.profile_memory:
                 warnings.warn(
                     'CVM does not support memory profile, using Stack VM.')
-            if self.use_cloop and self.allow_partial_eval:
+            if not self.use_cloop and self.allow_partial_eval:
                 warnings.warn(
-                    'CVM does not support partial evaluation yet, '
+                    'LoopGC does not support partial evaluation, '
                     'using Stack VM.')
             # Needed for allow_gc=True, profiling and storage_map reuse
             deps = self.compute_gc_dependencies(storage_map)
@@ -860,6 +875,7 @@ class VM_Linker(link.LocalLinker):
                 nodes, thunks, pre_call_clear,
                 storage_map, compute_map,
                 self.fgraph, self.allow_gc,
+                len(updated_vars),
                 dependencies=deps,
                 callback=self.callback,
                 callback_input=self.callback_input)
@@ -1000,7 +1016,8 @@ class VM_Linker(link.LocalLinker):
                     nodes, thunks, pre_call_clear,
                     storage_map, compute_map,
                     self.fgraph, self.allow_gc,
-                    dependencies=deps
+                    len(updated_vars),
+                    dependencies=deps,
                 )
         return vm
 
@@ -1031,15 +1048,20 @@ class VM_Linker(link.LocalLinker):
 
         reallocated_info = calculate_reallocate_info(
             order, fgraph, storage_map, compute_map_re, dependencies)
-
+        t0 = time.time()
+        linker_make_thunk_time = {}
+        impl = None
+        if self.c_thunks is False:
+            impl = 'py'
         for node in order:
             try:
-                if self.c_thunks is False:
-                    node.op._op_use_c_code = False
+                thunk_start = time.time()
                 thunks.append(node.op.make_thunk(node,
                                                  storage_map,
                                                  compute_map,
-                                                 no_recycling))
+                                                 no_recycling,
+                                                 impl=impl))
+                linker_make_thunk_time[node] = time.time() - thunk_start
                 if not hasattr(thunks[-1], 'lazy'):
                     # We don't want all ops maker to think about lazy Ops.
                     # So if they didn't specify that its lazy or not, it isn't.
@@ -1049,6 +1071,12 @@ class VM_Linker(link.LocalLinker):
                 e.args = ("The following error happened while"
                           " compiling the node", node, "\n") + e.args
                 raise
+        t1 = time.time()
+
+        if self.profile:
+            self.profile.linker_node_make_thunks += t1 - t0
+            self.profile.linker_make_thunk_time = linker_make_thunk_time
+
         for node, thunk in zip(order, thunks):
             thunk.inputs = [storage_map[v] for v in node.inputs]
             thunk.outputs = [storage_map[v] for v in node.outputs]
@@ -1058,7 +1086,7 @@ class VM_Linker(link.LocalLinker):
             lazy = config.vm.lazy
         if lazy is None:
             lazy = not all([(not th.lazy) for th in thunks])
-        if not (lazy or (config.profile and config.profile_memory) or
+        if not (lazy or ((config.profile or config.print_global_stats) and config.profile_memory) or
                 self.use_cloop or self.callback or self.callback_input):
             for pair in itervalues(reallocated_info):
                 storage_map[pair[1]] = storage_map[pair[0]]

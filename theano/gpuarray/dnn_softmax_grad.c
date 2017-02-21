@@ -46,17 +46,23 @@ if (APPLY_SPECIFIC(dx) != NULL)
 int APPLY_SPECIFIC(softmax_grad)(PyGpuArrayObject *dy,
                                  PyGpuArrayObject *sm,
                                  PyGpuArrayObject **dx,
-                                 PyGpuContextObject *c) {
+                                 cudnnHandle_t _handle) {
+  PyGpuContextObject *c = dy->context;
   cudnnStatus_t err;
-
-  if (c_set_tensorNd(dy, APPLY_SPECIFIC(dy)) != 0)
-    return 1;
-  if (c_set_tensorNd(sm, APPLY_SPECIFIC(sm)) != 0)
-    return 1;
 
   if (theano_prep_output(dx, PyGpuArray_NDIM(dy),
                          PyGpuArray_DIMS(dy), dy->ga.typecode,
                          GA_C_ORDER, c) != 0)
+    return 1;
+
+  // Directly return the output if any of the dimensions is 0.
+  // (cuDNN does not support zero-length dimensions.)
+  if (PyGpuArray_SIZE(*dx) == 0)
+    return 0;
+
+  if (c_set_tensorNd(dy, APPLY_SPECIFIC(dy)) != 0)
+    return 1;
+  if (c_set_tensorNd(sm, APPLY_SPECIFIC(sm)) != 0)
     return 1;
 
   if (c_set_tensorNd(*dx, APPLY_SPECIFIC(dx)) != 0)
@@ -91,7 +97,7 @@ int APPLY_SPECIFIC(softmax_grad)(PyGpuArrayObject *dy,
     cuda_wait((*dx)->ga.data, GPUARRAY_CUDA_WAIT_WRITE);
 
     err = cudnnSoftmaxBackward(
-      APPLY_SPECIFIC(_handle),
+      _handle,
       SOFTMAX_ALGO,
       SOFTMAX_MODE,
       alpha,

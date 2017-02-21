@@ -2,8 +2,7 @@ from __future__ import absolute_import, print_function, division
 from unittest import TestCase
 from nose.plugins.skip import SkipTest
 import itertools
-
-import numpy
+import numpy as np
 
 import theano
 from theano import tensor
@@ -18,7 +17,7 @@ from .test_basic_ops import makeTester, rand
 from ..blas import (gpugemv_inplace, gpugemv_no_inplace,
                     gpugemm_inplace, gpugemmbatch_no_inplace,
                     gpuger_inplace, gpuger_no_inplace,
-                    GpuGer, gpu_dot22, GpuGemm)
+                    GpuGer, gpu_dot22)
 
 
 GpuGemvTester = makeTester(
@@ -132,50 +131,15 @@ GpuDot22Tester = makeTester(
 )
 
 
-def test_hgemm_swap():
-    from theano.sandbox.cuda import nvcc_compiler
-    if nvcc_compiler.nvcc_version < '7.5':
-        raise SkipTest("SgemmEx is only avaialble on cuda 7.5+")
+def test_gemv_zeros():
+    W = tensor.matrix()
+    v = tensor.vector()
+    f = theano.function([W, v], W.dot(v), mode=mode_with_gpu)
 
-    v = tensor.vector(dtype='float16')
-    m = tensor.matrix(dtype='float16')
-    m2 = tensor.matrix(dtype='float16')
-    m32 = tensor.matrix(dtype='float32')
-
-    # test that we don't try to replace anything but matrix x matrix in float16
-    f = theano.function([v, m], tensor.dot(v, m), mode=mode_with_gpu)
-    assert len([node for node in f.maker.fgraph.apply_nodes
-                if isinstance(node.op, GpuGemm)]) == 0
-
-    f = theano.function([m32, m], tensor.dot(m32, m), mode=mode_with_gpu)
-    assert len([node for node in f.maker.fgraph.apply_nodes
-                if isinstance(node.op, GpuGemm)]) == 0
-
-    f = theano.function([m, m2], tensor.dot(m, m2), mode=mode_with_gpu)
-    assert len([node for node in f.maker.fgraph.apply_nodes
-                if isinstance(node.op, GpuGemm)]) == 1
-
-    v1 = numpy.random.random((3, 4)).astype('float16')
-    v2 = numpy.random.random((4, 2)).astype('float16')
-
-    of = f(v1, v2)
-    on = numpy.dot(v1, v2)
-
-    utt.assert_allclose(of, on)
-
-
-def test_hgemm_alpha_output_merge():
-    from theano.sandbox.cuda import nvcc_compiler
-    if nvcc_compiler.nvcc_version < '7.5':
-        raise SkipTest("SgemmEx is only avaialble on cuda 7.5+")
-
-    m1 = tensor.matrix(dtype='float16')
-    m2 = tensor.matrix(dtype='float16')
-
-    b = tensor.matrix(dtype='float16')
-
-    hgemm = numpy.asarray(0.05, dtype='float16') * (tensor.dot(m1, m2) + b)
-
-    f = theano.function([m1, m2, b], hgemm, mode=mode_with_gpu)
-    # there should be 3 gpu_from_host, 1 hgemm and 1 host_from_gpu
-    assert len(f.maker.fgraph.apply_nodes) == 5
+    # Apply to an empty matrix shape (5,0) and an empty vector shape (0,)
+    dim = 1000
+    A = np.zeros((dim, 0), dtype=theano.config.floatX)
+    b = np.zeros((0,), dtype=theano.config.floatX)
+    tmp = f(A, b)
+    assert np.allclose(tmp,
+                       np.zeros((dim,)))

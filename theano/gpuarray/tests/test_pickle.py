@@ -12,11 +12,13 @@ from six import reraise
 
 from nose.plugins.skip import SkipTest
 from nose.tools import assert_raises
-import numpy
+import numpy as np
 
 from theano.compat import PY3
 from theano import config
 from theano.misc.pkl_utils import CompatUnpickler
+
+from ..type import ContextNotDefined
 
 try:
     from . import config as _  # noqa
@@ -26,11 +28,9 @@ except SkipTest:
 
 
 def test_unpickle_gpuarray_as_numpy_ndarray_flag1():
-    """Only test when pygpu isn't
-    available. test_unpickle_gpuarray_as_numpy_ndarray_flag0 in
-    test_type.py test it when pygpu is there.
-
-    """
+    # Only test when pygpu isn't
+    # available. test_unpickle_gpuarray_as_numpy_ndarray_flag0 in
+    # test_type.py test it when pygpu is there.
     if have_pygpu:
         raise SkipTest("pygpu active")
     oldflag = config.experimental.unpickle_gpu_on_cpu
@@ -45,7 +45,7 @@ def test_unpickle_gpuarray_as_numpy_ndarray_flag1():
                 u = CompatUnpickler(fp, encoding="latin1")
             else:
                 u = CompatUnpickler(fp)
-            assert_raises(ImportError, u.load)
+            assert_raises((ImportError, ContextNotDefined), u.load)
     finally:
         config.experimental.unpickle_gpu_on_cpu = oldflag
 
@@ -75,7 +75,7 @@ def test_unpickle_gpuarray_as_numpy_ndarray_flag2():
                     reraise(SkipTest, exc_value, exc_trace)
                 raise
 
-        assert isinstance(mat, numpy.ndarray)
+        assert isinstance(mat, np.ndarray)
         assert mat[0] == -42.0
 
     finally:

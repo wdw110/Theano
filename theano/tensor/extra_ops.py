@@ -1,7 +1,6 @@
 from __future__ import absolute_import, print_function, division
 import numpy as np
 import numpy
-import warnings
 from six.moves import xrange
 
 import theano
@@ -243,13 +242,16 @@ def searchsorted(x, v, side='left', sorter=None):
     return SearchsortedOp(side=side)(x, v, sorter)
 
 
-class CumsumOp(theano.Op):
-    # See function cumsum for docstring
+class CumOp(theano.Op):
+    # See function cumsum/cumprod for docstring
 
-    __props__ = ("axis",)
+    __props__ = ("axis", "mode")
 
-    def __init__(self, axis=None):
+    def __init__(self, axis=None, mode='add'):
+        if mode not in ('add', 'mul'):
+            raise ValueError('%s: Unknown mode "%s"' % (type(self).__name__, mode))
         self.axis = axis
+        self.mode = mode
 
     def make_node(self, x):
         x = basic.as_tensor_variable(x)
@@ -265,20 +267,39 @@ class CumsumOp(theano.Op):
     def perform(self, node, inputs, output_storage):
         x = inputs[0]
         z = output_storage[0]
-        z[0] = np.cumsum(x, axis=self.axis)
+        z[0] = {'add': np.cumsum, 'mul': np.cumprod}[self.mode](x, axis=self.axis)
 
     def grad(self, inputs, output_gradients):
-        [gi] = output_gradients
+        x, = inputs
+        gi, = output_gradients
 
         if self.axis is None:
-            return [cumsum(gi[::-1])[::-1].reshape(inputs[0].shape)]
+            if self.mode == 'add':
+                return [cumsum(gi[::-1])[::-1].reshape(x.shape)]
+            elif self.mode == 'mul':
+                fx = cumprod(x, axis=self.axis)
+                return [cumsum(
+                    (fx * gi)[::-1])[::-1].reshape(x.shape) / x]
+            else:
+                raise NotImplementedError(
+                    '%s: unknown gradient for mode "%s"' %
+                    (type(self).__name__, self.mode))
 
-        # We need to reverse the gradients along ``self.axis``,
-        #  compute cumsum, then reverse again
         reverse_slicing = [slice(None, None, None)] * gi.ndim
         reverse_slicing[self.axis] = slice(None, None, -1)
         reverse_slicing = tuple(reverse_slicing)
-        return [cumsum(gi[reverse_slicing], self.axis)[reverse_slicing]]
+        # We need to reverse the gradients along ``self.axis``,
+        #  compute cumsum, then reverse again
+        if self.mode == 'add':
+            return [cumsum(gi[reverse_slicing], self.axis)[reverse_slicing]]
+        elif self.mode == 'mul':
+            fx = cumprod(x, axis=self.axis)
+            return [cumsum(
+                (fx * gi)[reverse_slicing], self.axis)[reverse_slicing] / x]
+        else:
+            raise NotImplementedError(
+                '%s: unknown gradient for mode "%s"' %
+                (type(self).__name__, self.mode))
 
     def infer_shape(self, node, shapes):
         if self.axis is None:
@@ -291,6 +312,7 @@ class CumsumOp(theano.Op):
         z, = onames
         axis = self.axis
         fail = sub['fail']
+        func = dict(mul='CumProd', add='CumSum')[self.mode]
 
         if self.axis is None or (self.axis == 0 and node.inputs[0].ndim == 1):
             code = """
@@ -304,13 +326,13 @@ class CumsumOp(theano.Op):
                 if (!%(z)s)
                     %(fail)s;
                 {
-                    PyObject * t = PyArray_CumSum(
+                    PyObject * t = PyArray_%(func)s(
                         %(x)s, NPY_MAXDIMS,
                         PyArray_TYPE((PyArrayObject*) py_%(x)s), %(z)s);
                     if (!t){
                        %(fail)s;
                     }
-                    // Because PyArray_CumSum returns a newly created reference on t.
+                    // Because PyArray_%(func)s returns a newly created reference on t.
                     Py_XDECREF(t);
                 }
             """ % locals()
@@ -326,13 +348,13 @@ class CumsumOp(theano.Op):
                     %(fail)s;
                 {
 
-                    PyObject * t = PyArray_CumSum(
+                    PyObject * t = PyArray_%(func)s(
                         %(x)s, %(axis)s,
                         PyArray_TYPE((PyArrayObject*) py_%(x)s), %(z)s);
                     if (!t){
                        %(fail)s;
                     }
-                    // Because PyArray_CumSum returns a newly created reference on t.
+                    // Because PyArray_%(func)s returns a newly created reference on t.
                     Py_XDECREF(t);
                 }
             """ % locals()
@@ -340,10 +362,10 @@ class CumsumOp(theano.Op):
         return code
 
     def c_code_cache_version(self):
-        return (6,)
+        return (7,)
 
     def __str__(self):
-        return "%s{%s}" % (self.__class__.__name__, self.axis)
+        return "%s{%s, %s}" % (self.__class__.__name__, self.axis, self.mode)
 
 
 def cumsum(x, axis=None):
@@ -359,115 +381,11 @@ def cumsum(x, axis=None):
         The axis along which the cumulative sum is computed.
         The default (None) is to compute the cumsum over the flattened array.
 
+
     .. versionadded:: 0.7
 
     """
-    return CumsumOp(axis=axis)(x)
-
-
-class CumprodOp(theano.Op):
-    # See function cumprod for docstring
-
-    __props__ = ("axis",)
-
-    def __init__(self, axis=None):
-        self.axis = axis
-
-    def make_node(self, x):
-        x = basic.as_tensor_variable(x)
-        out_type = x.type()
-
-        if self.axis is None:
-            out_type = theano.tensor.vector(dtype=x.dtype)  # Flatten
-        elif self.axis >= x.ndim or self.axis < -x.ndim:
-            raise ValueError('axis(={0}) out of bounds'.format(self.axis))
-
-        return theano.Apply(self, [x], [out_type])
-
-    def perform(self, node, inputs, output_storage):
-        x = inputs[0]
-        z = output_storage[0]
-        z[0] = np.cumprod(x, axis=self.axis)
-
-    def grad(self, inputs, output_gradients):
-        x, = inputs
-        gi, = output_gradients
-        fx = cumprod(x, axis=self.axis)
-
-        if self.axis is None:
-            return [cumsum((fx * gi)[::-1])[::-1].reshape(inputs[0].shape) / x]
-
-        # We need to reverse the gradients along ``self.axis``,
-        #  compute cumsum, then reverse again
-        reverse_slicing = [slice(None, None, None)] * gi.ndim
-        reverse_slicing[self.axis] = slice(None, None, -1)
-        reverse_slicing = tuple(reverse_slicing)
-        return [cumsum((fx * gi)[reverse_slicing],
-                       self.axis)[reverse_slicing] / x]
-
-    def infer_shape(self, node, shapes):
-        if self.axis is None:
-            return [(tensor.prod(shapes[0]),)]  # Flatten
-
-        return shapes
-
-    def c_code(self, node, name, inames, onames, sub):
-        x, = inames
-        z, = onames
-        axis = self.axis
-        fail = sub['fail']
-
-        if self.axis is None or (self.axis == 0 and node.inputs[0].ndim == 1):
-            code = """
-                npy_intp shape[1] = { PyArray_SIZE(%(x)s) };
-                if(!(%(z)s && PyArray_DIMS(%(z)s)[0] == shape[0]))
-                {
-                    Py_XDECREF(%(z)s);
-                    %(z)s = (PyArrayObject*) PyArray_SimpleNew(1, shape, PyArray_TYPE((PyArrayObject*) py_%(x)s));
-                }
-
-                if (!%(z)s)
-                    %(fail)s;
-                {
-                    PyObject * t = PyArray_CumProd(
-                        %(x)s, NPY_MAXDIMS,
-                        PyArray_TYPE((PyArrayObject*) py_%(x)s), %(z)s);
-                    if (!t){
-                       %(fail)s;
-                    }
-                    // Because PyArray_CumSum returns a newly created reference on t.
-                    Py_XDECREF(t);
-                }
-            """ % locals()
-        else:
-            code = """
-                if(!(%(z)s && PyArray_CompareLists(PyArray_DIMS(%(z)s), PyArray_DIMS(%(x)s), PyArray_NDIM(%(x)s)) ))
-                {
-                    Py_XDECREF(%(z)s);
-                    %(z)s = (PyArrayObject*) PyArray_SimpleNew(PyArray_NDIM(%(x)s), PyArray_DIMS(%(x)s), PyArray_TYPE((PyArrayObject*) py_%(x)s));
-                }
-
-                if (!%(z)s)
-                    %(fail)s;
-                {
-                    PyObject * t = PyArray_CumProd(
-                        %(x)s, %(axis)s,
-                        PyArray_TYPE((PyArrayObject*) py_%(x)s), %(z)s);
-                    if (!t){
-                       %(fail)s;
-                    }
-                    // Because PyArray_CumSum returns a newly created reference on t.
-                    Py_XDECREF(t);
-                }
-            """ % locals()
-
-        return code
-
-    def c_code_cache_version(self):
-        return (4,)
-
-    def __str__(self):
-        return "%s{%s}" % (self.__class__.__name__, self.axis)
+    return CumOp(axis=axis, mode='add')(x)
 
 
 def cumprod(x, axis=None):
@@ -484,10 +402,31 @@ def cumprod(x, axis=None):
         The axis along which the cumulative product is computed.
         The default (None) is to compute the cumprod over the flattened array.
 
+
     .. versionadded:: 0.7
 
     """
-    return CumprodOp(axis=axis)(x)
+    return CumOp(axis=axis, mode='mul')(x)
+
+
+# CumsumOp and CumprodOp are for compatibility with old version,
+# just in case unpickling a theano function with old Ops.
+class CumsumOp(theano.Op):
+    __props__ = ("axis",)
+
+    def __new__(typ, *args, **kwargs):
+        obj = object.__new__(CumOp, *args, **kwargs)
+        obj.mode = 'add'
+        return obj
+
+
+class CumprodOp(theano.Op):
+    __props__ = ("axis",)
+
+    def __new__(typ, *args, **kwargs):
+        obj = object.__new__(CumOp, *args, **kwargs)
+        obj.mode = 'mul'
+        return obj
 
 
 class DiffOp(theano.Op):
@@ -555,107 +494,11 @@ def diff(x, n=1, axis=-1):
     axis
         The axis along which the difference is taken, default is the last axis.
 
+
     .. versionadded:: 0.6
 
     """
     return DiffOp(n=n, axis=axis)(x)
-
-
-class BinCountOp(theano.Op):
-    """
-    .. note:: Deprecated
-              Use bincount() instead.
-              See function bincount for docstring.
-
-    """
-    compatible_type = ('int8', 'int16', 'int32', 'int64',
-                       'uint8', 'uint16', 'uint32', 'uint64')
-    """Tuple of all compatible dtype for the parameter of this op."""
-    __props__ = ("minlength",)
-
-    def __init__(self, minlength=None):
-        self.minlength = minlength
-        if minlength is not None:
-            numpy_ver = [int(n) for n in numpy.__version__.split('.')[:2]]
-            if not bool(numpy_ver >= [1, 6]):
-                raise NotImplementedError(
-                    "BinCountOp with minlength attribute"
-                    " requires NumPy 1.6 or higher.")
-
-    def make_node(self, x, weights):
-        warnings.warn((
-            "Tile op is deprecated, use tile function instead."),
-            stacklevel=3)
-
-        x = basic.as_tensor_variable(x)
-
-        if x.dtype not in BinCountOp.compatible_type:
-            raise TypeError("Inputs dtype must be an integer.")
-
-        # Some dtypes are not supported by numpy's implementation of bincount.
-        # Until another one is available, we should fail at graph construction
-        # time, not wait for execution.
-        int_bitwidth = theano.configdefaults.python_int_bitwidth()
-        if int_bitwidth == 64:
-            numpy_unsupported_dtypes = ('uint64',)
-        if int_bitwidth == 32:
-            numpy_unsupported_dtypes = ('uint32', 'int64', 'uint64')
-        intp_bitwidth = theano.configdefaults.local_bitwidth()
-        if intp_bitwidth == 32:
-            out_type = basic.ivector()
-        elif intp_bitwidth == 64:
-            out_type = basic.lvector()
-
-        if x.dtype in numpy_unsupported_dtypes:
-            raise TypeError(
-                ("Input dtypes %s are not supported by numpy.bincount, "
-                 % numpy_unsupported_dtypes), x.dtype)
-
-        if x.ndim != 1:
-            raise TypeError("Inputs must be of dimension 1.")
-
-        if weights is None:
-            weights = theano.gof.Constant(theano.gof.Generic(), None)
-        else:
-            weights = basic.as_tensor_variable(weights)
-            out_type = basic.dvector()
-            if weights.ndim != 1:
-                raise TypeError("Weights cannot have a number of"
-                                "dimension different of 1.")
-
-        return theano.Apply(self, [x, weights], [out_type])
-
-    def perform(self, node, inputs, output_storage):
-        x = inputs[0]
-        weights = inputs[1]
-        z = output_storage[0]
-
-        if weights is not None and weights.shape != x.shape:
-            raise TypeError("All inputs must have the same shape.")
-
-        # Needed for numpy 1.4.1 compatibility
-        if self.minlength:
-            out = np.bincount(x, weights=weights, minlength=self.minlength)
-        else:
-            out = np.bincount(x, weights=weights)
-
-        z[0] = theano._asarray(out, dtype=node.outputs[0].dtype)
-
-    def grad(self, inputs, outputs_gradients):
-        output = self(*inputs)
-
-        if output.dtype.find('int') != -1:
-            return [inp.zeros_like().astype(theano.config.floatX)
-                    for inp in inputs]
-
-        raise NotImplementedError()
-
-    def infer_shape(self, node, ins_shapes):
-        x = node.inputs[0]
-        m = basic.max(x) + 1
-        if self.minlength is not None:
-            m = basic.maximum(m, self.minlength)
-        return [[m]]
 
 
 def bincount(x, weights=None, minlength=None, assert_nonneg=False):
@@ -680,6 +523,7 @@ def bincount(x, weights=None, minlength=None, assert_nonneg=False):
         every input x is nonnegative.
         Optional.
 
+
     .. versionadded:: 0.6
 
     """
@@ -696,12 +540,14 @@ def bincount(x, weights=None, minlength=None, assert_nonneg=False):
     if minlength is not None:
         max_value = theano.tensor.maximum(max_value, minlength)
 
+    # Note: we do not use inc_subtensor(out[x], ...) in the following lines,
+    # since out[x] raises an exception if the indices (x) are int8.
     if weights is None:
         out = theano.tensor.zeros([max_value], dtype=x.dtype)
-        out = theano.tensor.inc_subtensor(out[x], 1)
+        out = theano.tensor.advanced_inc_subtensor1(out, 1, x)
     else:
         out = theano.tensor.zeros([max_value], dtype=weights.dtype)
-        out = theano.tensor.inc_subtensor(out[x], weights)
+        out = theano.tensor.advanced_inc_subtensor1(out, weights, x)
     return out
 
 
@@ -771,7 +617,7 @@ class RepeatOp(theano.Op):
         x = basic.as_tensor_variable(x)
         repeats = basic.as_tensor_variable(repeats)
 
-        if repeats.dtype not in tensor.discrete_dtypes:
+        if repeats.dtype not in tensor.integer_dtypes:
             raise TypeError("repeats.dtype must be an integer.")
 
         # Some dtypes are not supported by numpy's implementation of repeat.
@@ -884,7 +730,8 @@ def repeat(x, repeats, axis=None):
     ----------
     x
         Input data, tensor variable.
-    repeats : int, scalar or tensor variable
+    repeats
+        int, scalar or tensor variable
     axis : int, optional
 
     See Also
@@ -950,8 +797,7 @@ class Bartlett(gof.Op):
         if M.ndim != 0:
             raise TypeError('%s only works on scalar input'
                             % self.__class__.__name__)
-        elif (not M.dtype.startswith('int') and
-              not M.dtype.startswith('uint')):
+        elif M.dtype not in theano.tensor.integer_dtypes:
             # dtype is a theano attribute here
             raise TypeError('%s only works on integer input'
                             % self.__class__.__name__)
@@ -1120,7 +966,7 @@ class FillDiagonalOffset(gof.Op):
         if val.dtype != a.dtype:
             raise TypeError('%s: type of second parameter must be the same'
                             ' as the first\'s' % self.__class__.__name__)
-        elif offset.dtype[:3] != 'int':
+        elif offset.dtype not in theano.tensor.integer_dtypes:
             raise TypeError('%s: type of third parameter must be as integer'
                             ' use theano.tensor.cast( input, \'int32/int64\')'
                             % self.__class__.__name__)

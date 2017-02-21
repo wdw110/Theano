@@ -18,6 +18,7 @@ __contact__ = "Razvan Pascanu <r.pascanu@gmail>"
 import copy
 import logging
 import warnings
+from collections import OrderedDict
 
 import numpy
 
@@ -28,7 +29,6 @@ from six.moves import xrange
 from theano.compile.pfunc import rebuild_collect_shared
 from theano import gof, compat
 from theano import tensor, scalar
-from theano.compat import OrderedDict
 from theano.tensor.basic import get_scalar_constant_value
 
 
@@ -152,13 +152,15 @@ def traverse(out, x, x_copy, d, visited=None):
         return d
     visited.add(out)
     from theano.sandbox import cuda
-    from theano import gpuarray
+    from theano.gpuarray.basic_ops import gpu_from_host, host_from_gpu
+    from theano.gpuarray import pygpu_activated
+    from theano.gpuarray.type import GpuArrayType
     if out == x:
         if isinstance(x.type, cuda.CudaNdarrayType):
             d[out] = cuda.gpu_from_host(x_copy)
         else:
-            assert isinstance(x.type, gpuarray.GpuArrayType)
-            d[out] = gpuarray.GpuFromHost(x.type.context_name)(x_copy)
+            assert isinstance(x.type, GpuArrayType)
+            d[out] = gpu_from_host(x.type.context_name)(x_copy)
         return d
     elif out.owner is None:
         return d
@@ -167,8 +169,8 @@ def traverse(out, x, x_copy, d, visited=None):
           out.owner.inputs == [x]):
         d[out] = tensor.as_tensor_variable(x_copy)
         return d
-    elif (gpuarray.pygpu_activated and
-          out.owner.op == gpuarray.host_from_gpu and
+    elif (pygpu_activated and
+          out.owner.op == host_from_gpu and
           out.owner.inputs == [x]):
         d[out] = tensor.as_tensor_variable(x_copy)
         return d
@@ -1327,6 +1329,9 @@ def forced_replace(out, x, y):
     x := sigmoid(wu)
     forced_replace(out, x, y) := y*(1-y)
 
+    Note
+    ----
+    When it find a match, it don't continue on the corresponding inputs.
     """
     if out is None:
         return None
@@ -1334,18 +1339,18 @@ def forced_replace(out, x, y):
     # ``visited`` is a set of nodes that are already known and don't need to be
     # checked again, speeding up the traversal of multiply-connected graphs.
     visited = set()
-    def local_traverse(graph, x):
+    from collections import deque
+    q = deque()
+    q.append(out)
+    to_replace = []
+    while q:
+        graph = q.popleft()
         if graph in visited:
-            return []
+            continue
         visited.add(graph)
         if equal_computations([graph], [x]):
-            return [graph]
-        elif not graph.owner:
-            return []
-        else:
-            rval = []
-            for inp in graph.owner.inputs:
-                rval += local_traverse(inp, x)
-            return rval
-    to_replace = local_traverse(out, x)
-    return clone(out, replace=OrderedDict((v, y) for v in to_replace))
+            to_replace.append((graph, y))
+        elif graph.owner:
+            q.extendleft(graph.owner.inputs)
+
+    return clone(out, replace=to_replace)

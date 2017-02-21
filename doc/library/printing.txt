@@ -4,7 +4,7 @@
 :mod:`printing` -- Graph Printing and Symbolic Print Statement
 ===============================================================
 
-.. module:: printing
+.. module:: theano.printing
    :platform: Unix, Windows
    :synopsis: Provides the Print Op and graph-printing routines.
 .. moduleauthor:: LISA
@@ -118,7 +118,7 @@ Elemwise{mul} [id A] ''
    |x [id E]
    |Elemwise{sub} [id I] ''
      |TensorConstant{2} [id F]
-     |DimShuffle{} [id J] ''
+     |InplaceDimShuffle{} [id J] ''
        |TensorConstant{1} [id K]
 
 >>> theano.printing.debugprint(gy, depth=2)  # doctest: +NORMALIZE_WHITESPACE

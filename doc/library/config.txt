@@ -315,7 +315,7 @@ import theano and print the config variable, as in:
 
 .. attribute:: mode
 
-    String value: ``'Mode'``, ``'ProfileMode'`` (deprecated), ``'DebugMode'``, ``'FAST_RUN'``,
+    String value: ``'Mode'``, ``'DebugMode'``, ``'FAST_RUN'``,
     ``'FAST_COMPILE'``
 
     Default: ``'Mode'``
@@ -416,47 +416,11 @@ import theano and print the config variable, as in:
     `amdlibm <http://developer.amd.com/cpu/libraries/libm/>`__
     library, which is faster than the standard libm.
 
-.. attribute:: config.lib.cnmem
-
-    Float value: >= 0
-
-    Controls the use of `CNMeM <https://github.com/NVIDIA/cnmem>`_ (a
-    faster CUDA memory allocator). In Theano dev version until 0.8
-    is released.
-
-    The CNMeM library is included in Theano and does not need to be
-    separately installed.
-
-    The value represents the start size (either in MB or the fraction of total GPU
-    memory) of the memory pool. If more memory is needed, Theano will
-    try to obtain more, but this can cause memory fragmentation.
-
-        * 0: not enabled.
-        * 0 < N <= 1: use this fraction of the total GPU memory (clipped to .95 for driver memory).
-        * > 1: use this number in megabytes (MB) of memory.
-
-
-    Default: 0 (but should change later)
-
-    .. note::
-
-        This could cause memory fragmentation. So if you have a
-        memory error while using CNMeM, try to allocate more memory at
-        the start or disable it. If you try this, report your result
-        on :ref`theano-dev`.
-
-    .. note::
-
-        The clipping at 95% can be bypassed by specifing the exact
-        number of megabytes. If more then 95% are needed, it will try
-        automatically to get more memory. But this can cause
-        fragmentation, see note above.
-
 .. attribute:: config.gpuarray.preallocate
 
     Float value
 
-    Default: 0
+    Default: 0 (Preallocation of size 0, only cache the allocation)
 
     Controls the preallocation of memory with the gpuarray backend.
 
@@ -475,6 +439,11 @@ import theano and print the config variable, as in:
 
     .. note::
 
+        This value allocates GPU memory ONLY when using (:ref:`gpuarray`).
+        For the old backend, please see ``config.lib.cnmem``
+
+    .. note::
+
         This could cause memory fragmentation. So if you have a memory
         error while using the cache, try to allocate more memory at
         the start or disable it. If you try this, report your result
@@ -486,6 +455,63 @@ import theano and print the config variable, as in:
         number of megabytes. If more then 95% are needed, it will try
         automatically to get more memory. But this can cause
         fragmentation, see note above.
+
+.. attribute:: config.lib.cnmem
+
+    .. note::
+
+        This value allocates GPU memory ONLY when using (:ref:`cuda`)
+        and has no effect when the GPU backend is (:ref:`gpuarray`).
+        For the new backend, please see ``config.gpuarray.preallocate``
+
+    Float value: >= 0
+
+    Controls the use of `CNMeM <https://github.com/NVIDIA/cnmem>`_ (a
+    faster CUDA memory allocator). Applies to the old GPU backend 
+    :ref:`cuda` up to Theano release 0.8.
+
+    The CNMeM library is included in Theano and does not need to be
+    separately installed.
+
+    The value represents the start size (either in MB or the fraction of total GPU
+    memory) of the memory pool. If more memory is needed, Theano will
+    try to obtain more, but this can cause memory fragmentation.
+
+        * 0: not enabled.
+        * 0 < N <= 1: use this fraction of the total GPU memory (clipped to .95 for driver memory).
+        * > 1: use this number in megabytes (MB) of memory.
+
+
+    Default: 0
+
+    .. note::
+
+        This could cause memory fragmentation. So if you have a
+        memory error while using CNMeM, try to allocate more memory at
+        the start or disable it. If you try this, report your result
+        on :ref`theano-dev`.
+
+    .. note::
+
+        The clipping at 95% can be bypassed by specifing the exact
+        number of megabytes. If more then 95% are needed, it will try
+        automatically to get more memory. But this can cause
+        fragmentation, see note above.
+
+.. attribute:: config.gpuarray.sched
+
+    String value: ``'default'``, ``'multi'``, ``'single'``
+
+    Default: ``'default'``
+
+    Control the stream mode of contexts.
+
+    The sched parameter passed for context creation to pygpu.  With
+    CUDA, using "multi" mean using the parameter
+    cudaDeviceScheduleYield. This is useful to lower the CPU overhead
+    when waiting for GPU. One user found that it speeds up his other
+    processes that was doing data augmentation.
+
 
 .. attribute:: config.gpuarray.single_stream
 
@@ -559,7 +585,7 @@ import theano and print the config variable, as in:
 .. attribute:: config.warn.ignore_bug_before
 
     String value: ``'None'``, ``'all'``, ``'0.3'``, ``'0.4'``, ``'0.4.1'``, ``'0.5'``,
-    ``'0.6'``, ``'0.7'``, ``'0.8'``, ``'0.8.1'``, ``'0.8.2'``
+    ``'0.6'``, ``'0.7'``, ``'0.8'``, ``'0.8.1'``, ``'0.8.2'``, ``'0.9'``
 
     Default: ``'0.7'``
 
@@ -644,6 +670,14 @@ import theano and print the config variable, as in:
     Default: $CUDA_ROOT or failing that, ``"/usr/local/cuda"``
 
     A directory with bin/, lib/, include/ folders containing cuda utilities.
+
+.. attribute:: config.cuda.enabled
+
+    Bool value: either ``True`` of ``False``
+
+    Default: ``True``
+
+    If set to `False`, C code in old backend is not compiled.
 
 .. attribute:: config.dnn.enabled
 
@@ -872,7 +906,7 @@ import theano and print the config variable, as in:
 
     Controls whether NanGuardMode generates an error when it sees an inf.
 
-.. attribute:: config.NanGuardMode.nan_is_error
+.. attribute:: config.NanGuardMode.big_is_error
 
     Bool value, default: ``True``
 
@@ -1044,6 +1078,14 @@ import theano and print the config variable, as in:
     Bool value, default: ``False``
 
     If set to True, will preload the C module cache at import time
+
+.. attribute:: config.cmodule.age_thresh_use
+
+    Int value, default: ``60 * 60 * 24 * 24``  # 24 days
+
+    In seconds. The time after which a compiled c module won't be
+    reused by Theano. Automatic deletion of those c module 7 days
+    after that time.
 
 .. attribute:: config.traceback.limit
 

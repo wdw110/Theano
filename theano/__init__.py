@@ -31,10 +31,6 @@ import logging
 
 import sys
 
-if sys.platform == 'win32' and sys.version_info[0:2] == (3, 5):
-    raise RuntimeError(
-        "Theano do not support Python 3.5 on Windows. Use Python 2.7 or 3.4.")
-
 theano_logger = logging.getLogger("theano")
 logging_default_handler = logging.StreamHandler()
 logging_default_formatter = logging.Formatter(
@@ -72,15 +68,17 @@ from theano.compile import (
     SymbolicOutput, Out,
     Mode,
     predefined_modes, predefined_linkers, predefined_optimizers,
-    FunctionMaker, function, function_dump, OpFromGraph,
-    ProfileMode, ProfileStats,
+    FunctionMaker, function, function_dump,
+    OpFromGraph,
+    ProfileStats,
     Param, shared, as_op)
 
 from theano.misc.safe_asarray import _asarray
 
 from theano.printing import pprint, pp
 
-from theano.scan_module import scan, map, reduce, foldl, foldr, clone
+from theano.scan_module import (scan, map, reduce, foldl, foldr, clone,
+                                scan_checkpoints)
 
 from theano.updates import OrderedUpdates
 

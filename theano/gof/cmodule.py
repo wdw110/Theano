@@ -20,7 +20,7 @@ import platform
 import distutils.sysconfig
 import warnings
 
-import numpy.distutils  # TODO: TensorType should handle this
+import numpy.distutils
 
 import theano
 from theano.compat import PY3, decode, decode_iter
@@ -189,7 +189,7 @@ static struct PyModuleDef moduledef = {{
 
     def add_support_code(self, code):
         assert not self.finalized
-        if code not in self.support_code:  # TODO: KLUDGE
+        if code and code not in self.support_code:  # TODO: KLUDGE
             self.support_code.append(code)
 
     def add_function(self, fn):
@@ -535,14 +535,24 @@ class KeyData(object):
         """
         entry = self.get_entry()
         for key in self.keys:
-            del entry_from_key[key]
+            try:
+                del entry_from_key[key]
+            except KeyError:
+                # This happen if the compiledir was deleted during
+                # this process execution.
+                pass
         if do_manual_check:
             to_del = []
             for key, key_entry in iteritems(entry_from_key):
                 if key_entry == entry:
                     to_del.append(key)
             for key in to_del:
-                del entry_from_key[key]
+                try:
+                    del entry_from_key[key]
+                except KeyError:
+                    # This happen if the compiledir was deleted during
+                    # this process execution.
+                    pass
 
 
 class ModuleCache(object):
@@ -659,7 +669,7 @@ class ModuleCache(object):
         if do_refresh:
             self.refresh()
 
-    age_thresh_use = 60 * 60 * 24 * 24    # 24 days
+    age_thresh_use = config.cmodule.age_thresh_use  # default 24 days
     """
     The default age threshold (in seconds) for cache files we want to use.
 
@@ -1231,7 +1241,8 @@ class ModuleCache(object):
 
         self.time_spent_in_check_key += time.time() - start_time
 
-    age_thresh_del = 60 * 60 * 24 * 31  # 31 days
+    # default 31 days
+    age_thresh_del = config.cmodule.age_thresh_use + 60 * 60 * 24 * 7
     age_thresh_del_unversioned = 60 * 60 * 24 * 7  # 7 days
     """
     The default age threshold for `clear_old` (in seconds).
@@ -1711,9 +1722,10 @@ class Compiler(object):
 
     """
 
-    @staticmethod
-    def _try_compile_tmp(src_code, tmp_prefix='', flags=(),
-                         try_run=False, output=False, compiler=None):
+    @classmethod
+    def _try_compile_tmp(cls, src_code, tmp_prefix='', flags=(),
+                         try_run=False, output=False, compiler=None,
+                         comp_args=True):
         """
         Try to compile (and run) a test program.
 
@@ -1727,11 +1739,17 @@ class Compiler(object):
         If try_run is True, returns a (compile_status, run_status) pair.
         If output is there, we append the stdout and stderr to the output.
 
+        Compile arguments from the Compiler's compile_args() method are added
+        if comp_args=True.
         """
         if not compiler:
             return False
-
         flags = list(flags)
+        # Get compile arguments from compiler method if required
+        if comp_args:
+            args = cls.compile_args()
+        else:
+            args = []
         compilation_ok = True
         run_ok = False
         out, err = None, None
@@ -1748,7 +1766,7 @@ class Compiler(object):
                 os.close(fd)
                 fd = None
                 out, err, p_ret = output_subprocess_Popen(
-                    [compiler, path, '-o', exe_path] + flags)
+                    [compiler] + args + [path, '-o', exe_path] + flags)
                 if p_ret != 0:
                     compilation_ok = False
                 elif try_run:
@@ -1781,14 +1799,18 @@ class Compiler(object):
         else:
             return (compilation_ok, run_ok, out, err)
 
-    @staticmethod
-    def _try_flags(flag_list, preambule="", body="",
-                   try_run=False, output=False, compiler=None):
+    @classmethod
+    def _try_flags(cls, flag_list, preambule="", body="",
+                   try_run=False, output=False, compiler=None,
+                   comp_args=True):
         """
         Try to compile a dummy file with these flags.
 
         Returns True if compilation was successful, False if there
         were errors.
+
+        Compile arguments from the Compiler's compile_args() method are added
+        if comp_args=True.
 
         """
         if not compiler:
@@ -1802,9 +1824,10 @@ class Compiler(object):
             return 0;
         }
         """ % locals())
-        return Compiler._try_compile_tmp(code, tmp_prefix='try_flags_',
-                                         flags=flag_list, try_run=try_run,
-                                         output=output, compiler=compiler)
+        return cls._try_compile_tmp(code, tmp_prefix='try_flags_',
+                                    flags=flag_list, try_run=try_run,
+                                    output=output, compiler=compiler,
+                                    comp_args=comp_args)
 
 
 def try_march_flag(flags):
@@ -1873,7 +1896,8 @@ class GCC_compiler(Compiler):
 
         if ('g++' not in theano.config.cxx and
                 'clang++' not in theano.config.cxx and
-                'clang-omp++' not in theano.config.cxx):
+                'clang-omp++' not in theano.config.cxx and
+                'icpc' not in theano.config.cxx):
             _logger.warn(
                 "OPTIMIZATION WARNING: your Theano flag `cxx` seems not to be"
                 " the g++ compiler. So we disable the compiler optimization"
@@ -1911,12 +1935,10 @@ class GCC_compiler(Compiler):
                                 "CXXFLAGS=" in line or
                                 "-march=native" in line):
                             continue
-                        elif "-march=" in line:
-                            selected_lines.append(line.strip())
-                        elif "-mtune=" in line:
-                            selected_lines.append(line.strip())
-                        elif "-target-cpu" in line:
-                            selected_lines.append(line.strip())
+                        for reg in ["-march=", "-mtune=",
+                                    "-target-cpu", "-mabi="]:
+                            if reg in line:
+                                selected_lines.append(line.strip())
                     lines = list(set(selected_lines))  # to remove duplicate
 
                 return lines
@@ -2107,23 +2129,10 @@ class GCC_compiler(Compiler):
         if march_flags and GCC_compiler.march_flags:
             cxxflags.extend(GCC_compiler.march_flags)
 
-        # NumPy 1.7 Deprecate the old API. I updated most of the places
-        # to use the new API, but not everywhere. When finished, enable
-        # the following macro to assert that we don't bring new code
+        # NumPy 1.7 Deprecate the old API.
+        # The following macro asserts that we don't bring new code
         # that use the old API.
         cxxflags.append("-DNPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION")
-        numpy_ver = [int(n) for n in numpy.__version__.split('.')[:2]]
-
-        # numpy 1.7 deprecated the following macro but the new one didn't
-        # existed in the past
-        if bool(numpy_ver < [1, 7]):
-            cxxflags.append("-DNPY_ARRAY_ENSUREARRAY=NPY_ENSUREARRAY")
-            cxxflags.append("-DNPY_ARRAY_ENSURECOPY=NPY_ENSURECOPY")
-            cxxflags.append("-DNPY_ARRAY_ALIGNED=NPY_ALIGNED")
-            cxxflags.append("-DNPY_ARRAY_WRITEABLE=NPY_WRITEABLE")
-            cxxflags.append("-DNPY_ARRAY_UPDATE_ALL=NPY_UPDATE_ALL")
-            cxxflags.append("-DNPY_ARRAY_C_CONTIGUOUS=NPY_C_CONTIGUOUS")
-            cxxflags.append("-DNPY_ARRAY_F_CONTIGUOUS=NPY_F_CONTIGUOUS")
 
         # Platform-specific flags.
         # We put them here, rather than in compile_str(), so they en up
@@ -2157,18 +2166,18 @@ class GCC_compiler(Compiler):
 
         return cxxflags
 
-    @staticmethod
-    def try_compile_tmp(src_code, tmp_prefix='', flags=(),
-                        try_run=False, output=False):
-        return Compiler._try_compile_tmp(src_code, tmp_prefix, flags,
-                                         try_run, output,
-                                         theano.config.cxx)
+    @classmethod
+    def try_compile_tmp(cls, src_code, tmp_prefix='', flags=(),
+                        try_run=False, output=False, comp_args=True):
+        return cls._try_compile_tmp(src_code, tmp_prefix, flags,
+                                    try_run, output, theano.config.cxx,
+                                    comp_args)
 
-    @staticmethod
-    def try_flags(flag_list, preambule="", body="",
-                  try_run=False, output=False):
-        return Compiler._try_flags(flag_list, preambule, body, try_run, output,
-                                   theano.config.cxx)
+    @classmethod
+    def try_flags(cls, flag_list, preambule="", body="",
+                  try_run=False, output=False, comp_args=True):
+        return cls._try_flags(flag_list, preambule, body, try_run, output,
+                              theano.config.cxx, comp_args)
 
     @staticmethod
     def compile_str(module_name, src_code, location=None,
@@ -2250,7 +2259,10 @@ class GCC_compiler(Compiler):
             cmd.extend(p for p in preargs if not p.startswith('-O'))
         else:
             cmd.extend(preargs)
-        cmd.extend('-I%s' % idir for idir in include_dirs)
+        # to support path that includes spaces, we need to wrap it with double quotes on Windows
+        path_wrapper = "\"" if os.name == 'nt' else ""
+        cmd.extend(['-I%s%s%s' % (path_wrapper, idir, path_wrapper) for idir in include_dirs])
+        cmd.extend(['-L%s%s%s' % (path_wrapper, ldir, path_wrapper) for ldir in lib_dirs])
         if hide_symbols and sys.platform != 'win32':
             # This has been available since gcc 4.0 so we suppose it
             # is always available. We pass it here since it
@@ -2261,7 +2273,6 @@ class GCC_compiler(Compiler):
             cmd.append('-fvisibility=hidden')
         cmd.extend(['-o', lib_filename])
         cmd.append(cppfilename)
-        cmd.extend(['-L%s' % ldir for ldir in lib_dirs])
         cmd.extend(['-l%s' % l for l in libs])
         # print >> sys.stderr, 'COMPILING W CMD', cmd
         _logger.debug('Running cmd: %s', ' '.join(cmd))

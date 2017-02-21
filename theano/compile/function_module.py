@@ -12,13 +12,14 @@ import six.moves.cPickle as pickle
 from itertools import chain
 import time
 import warnings
-import numpy
+import numpy as np
 
 import theano
 from theano import config, gof
 from theano.compat import izip
 from theano.gof import graph
 import theano.compile.mode
+import theano.compile.profiling
 from theano.compile.io import (
     In, SymbolicInput, SymbolicOutput)
 from theano.compile.ops import deep_copy_op, view_op
@@ -663,7 +664,7 @@ class Function(object):
         input_storage = [i.value for i in ins]
         # reinitialize new maker and create new function
         if profile is None:
-            profile = config.profile
+            profile = config.profile or config.print_global_stats
             # profile -> True or False
         if profile is True:
             if name:
@@ -735,9 +736,13 @@ class Function(object):
         kwargs : dict
             The function inputs can be passed as keyword argument. For this, use
             the name of the input or the input instance as the key.
+
             Keyword argument ``output_subset`` is a list of either indices of the
             function's outputs or the keys belonging to the `output_keys` dict
-            and represent outputs that are requested to be calculated.
+            and represent outputs that are requested to be calculated. Regardless
+            of the presence of ``output_subset``, the updates are always calculated
+            and processed. To disable the updates, you should use the ``copy``
+            method with ``delete_updates=True``.
 
         Returns
         -------
@@ -745,6 +750,12 @@ class Function(object):
             List of outputs on indices/keys from ``output_subset`` or all of them,
             if ``output_subset`` is not passed.
         """
+        def restore_defaults():
+            for i, (required, refeed, value) in enumerate(self.defaults):
+                if refeed:
+                    if isinstance(value, gof.Container):
+                        value = value.storage[0]
+                    self[i] = value
         profile = self.profile
         t0 = time.time()
 
@@ -790,9 +801,17 @@ class Function(object):
                             function_name += ' with name "' + self.name + '"'
                         if hasattr(arg, 'name') and arg.name:
                             argument_name += ' with name "' + arg.name + '"'
-                        e.args = ("Bad input " + argument_name + " to " +
-                                  function_name + " at index %d (0-based)"
-                                  % i,) + e.args
+                        where = theano.gof.utils.get_variable_trace_string(
+                            self.maker.inputs[i].variable)
+                        if len(e.args) == 1:
+                            e.args = ("Bad input " + argument_name + " to " +
+                                      function_name + " at index %d (0-based). %s"
+                                      % (i, where) + e.args[0],)
+                        else:
+                            e.args = ("Bad input " + argument_name + " to " +
+                                      function_name + " at index %d (0-based). %s"
+                                      % (i, where),) + e.args
+                        restore_defaults()
                         raise
                 s.provided += 1
                 i += 1
@@ -818,9 +837,9 @@ class Function(object):
                              in args_share_memory[j]],
                             [self.input_storage[k].storage[0] for k
                              in args_share_memory[j]])
-                        if numpy.any([(var.type is i_var.type and
-                                       var.type.may_share_memory(val, i_val))
-                                      for (var, val) in group_j]):
+                        if np.any([(var.type is i_var.type and
+                                  var.type.may_share_memory(val, i_val))
+                                  for (var, val) in group_j]):
 
                             is_aliased = True
                             args_share_memory[j].append(i)
@@ -842,14 +861,17 @@ class Function(object):
         if not self.trust_input:
             for c in self.input_storage:
                 if c.required and not c.provided:
+                    restore_defaults()
                     raise TypeError("Missing required input: %s" %
                                     getattr(self.inv_finder[c], 'variable',
                                             self.inv_finder[c]))
                 if c.provided > 1:
+                    restore_defaults()
                     raise TypeError("Multiple values for input: %s" %
                                     getattr(self.inv_finder[c], 'variable',
                                             self.inv_finder[c]))
                 if c.implicit and c.provided > 0:
+                    restore_defaults()
                     raise TypeError(
                         'Tried to provide value for implicit input: %s'
                         % getattr(self.inv_finder[c], 'variable',
@@ -862,6 +884,7 @@ class Function(object):
                 self.fn() if output_subset is None else\
                 self.fn(output_subset=output_subset)
         except Exception:
+            restore_defaults()
             if hasattr(self.fn, 'position_of_error'):
                 # this is a new vm-provided function or c linker
                 # they need this because the exception manipulation
@@ -914,11 +937,7 @@ class Function(object):
             outputs = outputs[:self.n_returned_outputs]
 
         # Put default values back in the storage
-        for i, (required, refeed, value) in enumerate(self.defaults):
-            if refeed:
-                if isinstance(value, gof.Container):
-                    value = value.storage[0]
-                self[i] = value
+        restore_defaults()
         #
         # NOTE: This logic needs to be replicated in
         #       scan.
@@ -926,6 +945,7 @@ class Function(object):
         #
 
         dt_call = time.time() - t0
+        theano.compile.profiling.total_fct_exec_time += dt_call
         self.maker.mode.call_time += dt_call
         if profile:
             profile.fct_callcount += 1
@@ -1008,9 +1028,9 @@ def _pickle_Function(f):
         all_data = input_storage + inputs_data
         for i, d_i in enumerate(all_data):
             for j, d_j in enumerate(all_data):
-                if ((i < j) and isinstance(d_i, numpy.ndarray) and
-                        isinstance(d_j, numpy.ndarray)):
-                    if numpy.may_share_memory(d_i, d_j):
+                if ((i < j) and isinstance(d_i, np.ndarray) and
+                        isinstance(d_j, np.ndarray)):
+                    if np.may_share_memory(d_i, d_j):
                         if f.pickle_aliased_memory_strategy == 'warn':
                             _logger.warning('aliased relationship between '
                                             'Function arguments %s, %s '
@@ -1030,7 +1050,7 @@ def _constructor_Function(maker, input_storage, inputs_data):
     assert len(f.input_storage) == len(inputs_data)
     for container, x in zip(f.input_storage, inputs_data):
         assert (container.data is x) or \
-            (isinstance(x, numpy.ndarray) and (container.data == x).all()) or \
+            (isinstance(x, np.ndarray) and (container.data == x).all()) or \
             (container.data == x)
     return f
 
@@ -1040,7 +1060,6 @@ copyreg.pickle(Function, _pickle_Function)
 ###
 # FunctionMaker
 ###
-
 def insert_deepcopy(fgraph, wrapped_inputs, wrapped_outputs):
     """
     Insert deepcopy in the fgraph to break aliasing of outputs
@@ -1056,17 +1075,18 @@ def insert_deepcopy(fgraph, wrapped_inputs, wrapped_outputs):
     # memory contract
 
     # We don't insert deep copy when the output.borrow is True for all
-    # conserned outputs.
+    # concerned outputs.
 
     assert len(wrapped_inputs) == len(fgraph.inputs)
     assert len(wrapped_outputs) == len(fgraph.outputs)
     reason = "insert_deepcopy"
-    updated_fgraph_inputs = [fgraph_i for i, fgraph_i in
-                             zip(wrapped_inputs, fgraph.inputs)
-                             if getattr(i, 'update', False)]
+    updated_fgraph_inputs = set([fgraph_i for i, fgraph_i in
+                                zip(wrapped_inputs, fgraph.inputs)
+                                if getattr(i, 'update', False)])
 
     # We can't use fgraph.inputs as this don't include Constant Value.
     all_graph_inputs = gof.graph.inputs(fgraph.outputs)
+    has_destroyers = hasattr(fgraph, 'get_destroyers_of')
 
     for i in xrange(len(fgraph.outputs)):
         views_of_output_i = set()
@@ -1095,12 +1115,9 @@ def insert_deepcopy(fgraph, wrapped_inputs, wrapped_outputs):
                 #    e.g. in-place computations
                 # b) that j'th input is a shared variable that is also
                 #    being updated
-                if (hasattr(fgraph, 'get_destroyers_of') and
-                        fgraph.get_destroyers_of(input_j)):
-                    continue
                 if input_j in updated_fgraph_inputs:
                     continue
-                if input_j in views_of_output_i:
+                if input_j in views_of_output_i and not (has_destroyers and fgraph.get_destroyers_of(input_j)):
                     # We don't put deep_copy_op if the input and the
                     # output have borrow==True
                     if input_j in fgraph.inputs:
@@ -1377,17 +1394,11 @@ class FunctionMaker(object):
                  output_keys=None):
         mode = theano.compile.mode.get_mode(mode)
 
-        # figure out which profile object to use (if any)
-        # to help with forward-porting ProfileMode,
-        # we allow ProfileMode to provide a ProfileStats object
-        # using this somewhat awkward mechanism.
-        mode_profile = getattr(mode, 'profile', None)
-        if (profile is not None and
-                profile is not False and
-                mode_profile is not None):
+        # Assert old way of working isn't used
+        if getattr(mode, 'profile', None):
             raise TypeError(
-                'profile passed via both "mode" and "profile" arguments')
-        self.profile = profile = profile or mode_profile
+                "profile passed via 'mode'. This isn't supported anymore")
+        self.profile = profile
         if profile:
             # This is very important:
             # 1) We preload the cache here to don't have its timming
@@ -1464,6 +1475,7 @@ class FunctionMaker(object):
 
                 end_optimizer = time.time()
                 opt_time = end_optimizer - start_optimizer
+                theano.compile.profiling.total_graph_opt_time += opt_time
                 if profile:
                     profile.optimizer_time += opt_time
                     if theano.config.profile_optimizer:
@@ -1496,9 +1508,10 @@ class FunctionMaker(object):
                      if not spec.borrow]
         if no_borrow:
             self.linker = linker.accept(
-                fgraph, no_recycling=infer_reuse_pattern(fgraph, no_borrow))
+                fgraph, no_recycling=infer_reuse_pattern(fgraph, no_borrow),
+                profile=profile)
         else:
-            self.linker = linker.accept(fgraph)
+            self.linker = linker.accept(fgraph, profile=profile)
 
         if hasattr(linker, 'accept_var_updates'):
             # hacky thing so VMLinker knows about updates
@@ -1652,6 +1665,7 @@ class FunctionMaker(object):
         end_linker = time.time()
 
         linker_time = end_linker - start_linker
+        theano.compile.profiling.total_time_linker += linker_time
         _logger.debug('Linker took %f seconds', linker_time)
         if self.profile:
             self.profile.linker_time += linker_time
@@ -1722,8 +1736,8 @@ def orig_function(inputs, outputs, mode=None, accept_inplace=False,
         Default of None means to use `config.mode` (see below for descriptive
         string list).
     name : str
-        An optional name for this fct. If used, the profile mode will print the
-        time spent in this fct.
+        An optional name for this function. If used, the profile mode will print the
+        time spent in this function.
     accept_inplace : bool
         True iff the graph can contain inplace operations prior to the
         optimization phase (default is False).
@@ -1742,9 +1756,6 @@ def orig_function(inputs, outputs, mode=None, accept_inplace=False,
     - FAST_RUN (default) (optimize without too much time)
 
     - FAST_COMPILE (minimal optimization)
-
-    - ProfileMode(deprecated): allow to print a profile mode with
-      mode.print_summary
 
     - DebugMode: verify many internal conditions that are normally assumed
       (slow)

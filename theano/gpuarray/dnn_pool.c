@@ -42,9 +42,10 @@ int APPLY_SPECIFIC(dnn_pool)(PyGpuArrayObject *img,
                              PyArrayObject *stride,
                              PyArrayObject *pad,
                              PyGpuArrayObject **out,
-                             PyGpuContextObject *c) {
-  cudnnStatus_t err;
+                             cudnnHandle_t _handle) {
+  PyGpuContextObject *c = img->context;
   size_t dims[5];
+  cudnnStatus_t err;
 
   if (!GpuArray_IS_C_CONTIGUOUS(&img->ga)) {
     PyErr_SetString(PyExc_ValueError, "Only contiguous inputs are supported.");
@@ -70,11 +71,7 @@ int APPLY_SPECIFIC(dnn_pool)(PyGpuArrayObject *img,
      s[i] = *((npy_intp*)PyArray_GETPTR1(stride, i));
   }
 
-#if CUDNN_VERSION >= 5000
   err = cudnnSetPoolingNdDescriptor(APPLY_SPECIFIC(pool), MODE_FLAG, CUDNN_PROPAGATE_NAN, ndims, w, p, s);
-#else
-  err = cudnnSetPoolingNdDescriptor(APPLY_SPECIFIC(pool), MODE_FLAG, ndims, w, p, s);
-#endif
 
   if (err != CUDNN_STATUS_SUCCESS) {
     PyErr_Format(PyExc_RuntimeError, "could not set op descriptor %s", cudnnGetErrorString(err));
@@ -122,7 +119,7 @@ int APPLY_SPECIFIC(dnn_pool)(PyGpuArrayObject *img,
     cuda_wait((*out)->ga.data, GPUARRAY_CUDA_WAIT_WRITE);
 
     err = cudnnPoolingForward(
-      APPLY_SPECIFIC(_handle), APPLY_SPECIFIC(pool),
+      _handle, APPLY_SPECIFIC(pool),
       alpha,
       APPLY_SPECIFIC(input), PyGpuArray_DEV_DATA(img),
       beta,

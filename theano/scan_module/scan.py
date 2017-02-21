@@ -47,6 +47,7 @@ __contact__ = "Razvan Pascanu <r.pascanu@gmail>"
 import logging
 import numpy
 import warnings
+from collections import OrderedDict
 
 from theano.compat import ifilter, izip
 from six import iteritems, integer_types
@@ -59,7 +60,6 @@ from theano import tensor
 from theano import config
 from theano.updates import OrderedUpdates
 from theano.compile import ops
-from theano.compat import OrderedDict
 
 
 from theano.scan_module import scan_op
@@ -81,7 +81,8 @@ def scan(fn,
          name=None,
          profile=False,
          allow_gc=None,
-         strict=False):
+         strict=False,
+         return_list=False):
     """
     This function constructs and applies a Scan op to the provided
     arguments.
@@ -265,11 +266,9 @@ def scan(fn,
         ``n_steps`` is the number of steps to iterate given as an int
         or Theano scalar. If any of the input sequences do not have
         enough elements, scan will raise an error. If the *value is 0* the
-        outputs will have *0 rows*. If the value is negative, ``scan``
-        will run backwards in time. If the ``go_backwards`` flag is already
-        set and also ``n_steps`` is negative, ``scan`` will run forward
-        in time. If n_steps is not provided, ``scan`` will figure
-        out the amount of steps it should run given its input sequences.
+        outputs will have *0 rows*. If n_steps is not provided, ``scan`` will
+        figure out the amount of steps it should run given its input
+        sequences. ``n_steps`` < 0 is not supported anymore.
 
     truncate_gradient
         ``truncate_gradient`` is the number of steps to use in truncated
@@ -335,6 +334,9 @@ def scan(fn,
         If true, all the shared variables used in ``fn`` must be provided as a
         part of ``non_sequences`` or ``sequences``.
 
+    return_list
+        If True, will always return a list, even if there is only 1 output.
+
     Returns
     -------
     tuple
@@ -398,7 +400,7 @@ def scan(fn,
 
     # Check n_steps is an int
     if (hasattr(n_steps, 'dtype') and
-        str(n_steps.dtype)[:3] not in ('uin', 'int')):
+        str(n_steps.dtype) not in tensor.integer_dtypes):
         raise ValueError(' n_steps must be an int. dtype provided '
                          'is %s' % n_steps.dtype)
 
@@ -449,6 +451,16 @@ def scan(fn,
                              getattr(outs_info[i]['initial'], 'name', 'None'),
                              i)
                 outs_info[i]['taps'] = [-1]
+            elif outs_info[i].get('taps', None) is not None:
+                # Check that taps are valid (< 0 and all dfferent)
+                taps = outs_info[i]['taps']
+                if len(taps) > len(set(taps)):
+                    raise ValueError(('All the taps must be different in '
+                                      ' `outputs_info`'), outs_info[i])
+                for t in taps:
+                    if t >= 0:
+                        raise ValueError(('All the tap values must be '
+                                          'smaller than 0.'), outs_info[i])
         else:
             # if a None is provided as the output info we replace it
             # with an empty OrdereDict() to simplify handling
@@ -786,7 +798,8 @@ def scan(fn,
                 return_steps.get(pos, 0) != 1):
                 outputs[pos] = tensor.unbroadcast(
                     tensor.shape_padleft(inner_out), 0)
-        if len(outputs) == 1:
+
+        if return_list is not True and len(outputs) == 1:
             outputs = outputs[0]
 
         return (outputs, updates)
@@ -1126,8 +1139,9 @@ def scan(fn,
             # refers to update rule of index -1 - `pos`.
             update_map[sit_sot_shared[abs(pos) - 1]] = _scan_out_list[idx][-1]
     scan_out_list = [x for x in scan_out_list if x is not None]
-    if len(scan_out_list) == 1:
+    if return_list is not True and len(scan_out_list) == 1:
         scan_out_list = scan_out_list[0]
     elif len(scan_out_list) == 0:
         scan_out_list = None
+
     return (scan_out_list, update_map)

@@ -1,13 +1,15 @@
 from __future__ import absolute_import, print_function, division
 import copy
-import numpy
+import numpy as np
 
 import theano
 from theano import Apply, scalar, config, Op
 from six.moves import StringIO, xrange
 from theano.gof.utils import MethodNotDefined
-from theano.scalar import Scalar
+from theano.scalar import Scalar, Composite
 from theano.tensor.elemwise import (Elemwise, DimShuffle, CAReduceDtype)
+from theano.scalar.basic_scipy import Erfinv, Erfcinv
+from theano.scalar.basic import upgrade_to_float_no_complex, complex_types
 
 try:
     import pygpu
@@ -25,12 +27,60 @@ from .fp16_help import load_w, write_w
 
 
 def make_argument(v, name):
-    return ArrayArg(numpy.dtype(v.type.dtype), name)
+    return ArrayArg(np.dtype(v.type.dtype), name)
 
 
 def as_C_string_const(s):
     return '\n'.join('"%s\\n"' % (l.replace('"', '\\"'))
                      for l in s.split('\n'))
+
+
+def get_scal(dt):
+    if dt == 'float16':
+        dt = 'float32'
+    return scalar.get_scalar_type(dt)
+
+
+def max_inputs_to_GpuElemwise(node_or_outputs):
+    """
+    Compute the maximum number of inputs that fit in a kernel call.
+    """
+    if isinstance(node_or_outputs, Apply):
+        outputs = node_or_outputs.outputs
+    else:
+        outputs = node_or_outputs
+
+    n_out = len(outputs)
+    ndim = outputs[0].type.ndim
+
+    ptr_size = 8
+    # Even with call32, the interface does not change, and shapes,
+    # strides, and offset are passed as 64-bits (8 bytes)
+    int_size = 8
+
+    # we take the limit from CUDA for now
+    nb_bytes_total = 4096
+
+    # Regardless of the number of arguments, we have:
+    # - The total number of elements (int)
+    # - The shape (int) on each dimension
+    fixed_size = int_size + int_size * ndim
+
+    # Each argument (input or output) has:
+    # - 1 pointer (ptr)
+    # - 1 offset (int)
+    # - 1 stride (int) per dimension
+    # Even if the tensor ends up being contiguous, code for the
+    # non-contiguous case still needs to be generated.
+    param_size = ptr_size + int_size + int_size * ndim
+
+    # Remaining for inputs
+    nb_bytes_for_inputs = nb_bytes_total - fixed_size - param_size * n_out
+
+    # Maximum number of inputs
+    max_nb_inputs = nb_bytes_for_inputs // param_size
+
+    return max_nb_inputs
 
 
 class GpuElemwise(HideC, Elemwise):
@@ -49,32 +99,36 @@ class GpuElemwise(HideC, Elemwise):
         items = str(sorted(self.inplace_pattern.items()))
         return "GpuElemwise{%s}%s<gpuarray>" % (self.scalar_op, items)
 
+    def max_inputs(self, node_or_outputs):
+        return max_inputs_to_GpuElemwise(node_or_outputs)
+
     def make_node(self, *inputs):
         ctx_name = infer_context_name(*inputs)
-        res = Elemwise.make_node(self, *inputs)
-        outputs = [GpuArrayType(broadcastable=o.type.broadcastable,
+        inputs = [as_gpuarray_variable(i, ctx_name) for i in inputs]
+        out_info = Elemwise.get_output_info(self, GpuDimShuffle, *inputs)
+        inputs = out_info[2]
+        outputs = [GpuArrayType(broadcastable=br,
                                 context_name=ctx_name,
-                                dtype=o.type.dtype)() for o in res.outputs]
+                                dtype=dtype)() for dtype, br in
+                   zip(out_info[0], out_info[1])]
         if len(outputs) > 1:
             raise NotImplementedError()
-        inputs = [as_gpuarray_variable(i, ctx_name) for i in inputs]
-        node = Apply(self, inputs, outputs)
+
+        if len(inputs) > max_inputs_to_GpuElemwise(outputs):
+            raise NotImplementedError(
+                "Can not make this GpuElemwise with that much inputs")
 
         # Try to generate the kernel to catch SupportCodeErrors
+        scal_ins = [get_scal(i.dtype) for i in inputs]
+        fake_node = self.scalar_op.make_node(*[i() for i in scal_ins])
         try:
-            scal_ins = [scalar.get_scalar_type(i.dtype) for i in node.inputs]
-
-            scal_out = [scalar.get_scalar_type(o.dtype) for o in node.outputs]
-
-            fake_node = Apply(self.scalar_op, [i() for i in scal_ins],
-                              [o() for o in scal_out])
-            code = self.scalar_op.c_support_code_apply(fake_node, "test")
+            code = fake_node.op.c_support_code_apply(fake_node, "test")
             if code:
                 raise SupportCodeError(code)
         except MethodNotDefined:
             pass
         try:
-            support_code = self.scalar_op.c_support_code()
+            support_code = fake_node.op.c_support_code()
             if "struct" in support_code:
                 # The macro is fine, the C++ struct is not.
                 raise SupportCodeError(
@@ -83,6 +137,7 @@ class GpuElemwise(HideC, Elemwise):
         except MethodNotDefined:
             pass
 
+        node = Apply(self, inputs, outputs)
         return node
 
     def get_params(self, node):
@@ -90,62 +145,43 @@ class GpuElemwise(HideC, Elemwise):
 
     def _get_vnames(self, node):
         inps = ['i%d' % (n,) for n, _ in enumerate(node.inputs)]
-        outs = ['o%d' % (n,) for n, _ in enumerate(node.outputs) if n not in self.inplace_pattern]
+        outs = ['o%d' % (n,) if n not in self.inplace_pattern else
+                inps[self.inplace_pattern[n]]
+                for n, _ in enumerate(node.outputs)]
         return inps, outs
 
     def _generate_op_string(self, node):
-        scal_v_ins = [scalar.get_scalar_type(i.dtype) for i in node.inputs]
-        scal_v_outs = [scalar.get_scalar_type(o.dtype) for o in node.outputs]
         inps, outs = self._get_vnames(node)
+        scal_v_ins = [get_scal(i.dtype)() for i in node.inputs]
 
-        fake_node = Apply(self.scalar_op, [i() for i in scal_v_ins],
-                          [o() for o in scal_v_outs])
+        # As float16 isn't a c type and most GPU don't compute on it,
+        # We convert the computation to float32, and let libgpuarray
+        # load in float16 and cast to float32 and do the reverse for
+        # the output.
+        scalar_op = self.scalar_op
+        if isinstance(scalar_op, (scalar.Cast, Composite)):
+            scalar_op = scalar_op.clone_float32()
+        fake_node = scalar_op.make_node(*scal_v_ins)
+        scal_v_out = fake_node.outputs
+        assert len(scal_v_out) == len(node.outputs)
 
-        scal_in = [i if si.dtype != 'float16' else
-                   'load_half(&' + i + ')' for i, si in zip(inps, scal_v_ins)]
+        kop = fake_node.op.c_code(fake_node, 'elem_scalar',
+                                  inps, outs,
+                                  dict(fail='return;'))
 
-        scal_out = []
-        oi = 0
-        scal_f16 = []
-        for n in range(len(node.outputs)):
-            if n in self.inplace_pattern:
-                arg = inps[self.inplace_pattern[n]]
-            else:
-                arg = outs[oi]
-                oi += 1
-            if node.outputs[n].dtype == 'float16':
-                scal_f16.append(('tmpf16%i' % (len(scal_f16),), arg))
-                scal_out.append(scal_f16[-1][0])
-            else:
-                scal_out.append(arg)
-
-        kop = self.scalar_op.c_code(fake_node, 'elem_scalar',
-                                    scal_in, scal_out,
-                                    dict(fail='return;'))
-
-        if scal_f16:
-            # if we have float16 scalars on output we have to wrap
-            # them and insert a stand-in float32 variable since
-            # float16 arithemtic is not available
-            code = ["{"]
-            for f in scal_f16:
-                code.append('ga_float %s;' % (f[0],))
-            # XXX: The replace is an ugly hack to make sure temp
-            # variables inthe middle are float32
-            code.append(kop.replace('npy_float16', 'ga_float'))
-            for f in scal_f16:
-                code.append('store_half(&%s, %s);' % (f[1], f[0]))
-            code.append('}')
-            kop = '\n'.join(code)
+        # If the following assert fail, then we need to update the
+        # code handler above.
+        assert 'npy_float16' not in kop
 
         support_code = ""
         try:
             # We accept only some c_support_code().
             # This filter is done in the make_node()
-            support_code += self.scalar_op.c_support_code()
+            support_code += fake_node.op.c_support_code()
         except MethodNotDefined:
             pass
-        for npy, ga in [("npy_uint8", "ga_ubyte"),
+        for npy, ga in [("npy_bool", "ga_bool"),
+                        ("npy_uint8", "ga_ubyte"),
                         ("npy_uint16", "ga_ushort"),
                         ("npy_uint32", "ga_uint"),
                         ("npy_uint64", "ga_ulong"),
@@ -169,7 +205,7 @@ class GpuElemwise(HideC, Elemwise):
 
     def c_init_code_struct(self, node, name, sub):
         inps, outs = self._get_vnames(node)
-        nargs = len(inps) + len(outs)
+        nargs = len(inps) + len(outs) - len(self.inplace_pattern)
         support_code, kop = self._generate_op_string(node)
         res = """
         gpuelemwise_arg args[%(nargs)s] = {{0}};
@@ -183,24 +219,22 @@ class GpuElemwise(HideC, Elemwise):
             """ % dict(n=n, name='"%s"' % (name,),
                        typecode=i.type.typecode)
 
-        p = 0
+        p = len(inps)
         for n, o in enumerate(node.outputs):
             if n in self.inplace_pattern:
                 assert(len(node.outputs) == 1)
                 res += "\nargs[%(n)s].flags |= GE_WRITE;\n" % dict(n=self.inplace_pattern[n])
             else:
-                nn = len(inps) + p
-                name = outs[p]
-                p += 1
                 res += """
                 args[%(n)s].name = %(name)s;
                 args[%(n)s].typecode = %(typecode)s;
                 args[%(n)s].flags = GE_WRITE;
-                """ % dict(n=nn, name='"%s"' % (name,),
+                """ % dict(n=p, name='"%s"' % (outs[n],),
                            typecode=o.type.typecode)
+                p += 1
 
         res += """
-        ge = GpuElemwise_new(%(ctx)s->ctx, %(support)s, %(kop)s, %(nargs)s, args, %(nd)s, 0);
+        ge = GpuElemwise_new(%(ctx)s->ctx, %(support)s, %(kop)s, %(nargs)s, args, %(nd)s, GE_CONVERT_F16);
         if (ge == NULL) {
            PyErr_SetString(PyExc_RuntimeError, "Could not initialize elemwise support");
            %(fail)s
@@ -361,7 +395,7 @@ class GpuElemwise(HideC, Elemwise):
     def c_code_cache_version(self):
         ver = self.scalar_op.c_code_cache_version()
         if ver:
-            return (7, ver)
+            return (8, ver)
         else:
             return ver
 
@@ -621,13 +655,23 @@ class GpuCAReduceCuda(GpuKernelBase, HideC, CAReduceDtype):
 
         try:
             self.c_code(node, name, inp, out, sub)
-            self.c_support_code_apply(node, name)
+            if not self.gpu_kernels(node, name):
+                return False
         except NotImplementedError:
             return False
         return True
 
     def c_headers(self):
         return ['<numpy_compat.h>', '<gpuarray/types.h>']
+
+    def c_support_code(self):
+        return """
+        template <typename T>
+        static T ceil_intdiv(T a, T b)
+        {
+            return (a/b) + ((a % b) ? 1: 0);
+        }
+        """
 
     def c_code(self, node, name, inp, out, sub):
         x, = inp
@@ -791,7 +835,7 @@ class GpuCAReduceCuda(GpuKernelBase, HideC, CAReduceDtype):
                         (void *)%(z)s->ga.data,
                         (void *)&%(z)s->ga.offset,
                         (void *)&stride_Z0};
-                int err = GpuKernel_call(&%(k_var)s, 3, n_threads, n_blocks, n_shared, kernel_params);
+                int err = GpuKernel_call(&%(k_var)s, 3, n_blocks, n_threads, n_shared, kernel_params);
                 %(err_check)s
         """
         in_dtype = "npy_" + node.inputs[0].dtype
@@ -857,7 +901,7 @@ class GpuCAReduceCuda(GpuKernelBase, HideC, CAReduceDtype):
                                   n_blocks[0],n_blocks[1],n_blocks[2],
                                   n_blocks[0]*n_blocks[1]*n_blocks[2],
                                   n_shared, %(shapes_data)s);
-            int err = GpuKernel_call(&%(k_var)s, 3, n_threads, n_blocks, n_shared, kernel_params);
+            int err = GpuKernel_call(&%(k_var)s, 3, n_blocks, n_threads, n_shared, kernel_params);
             %(err_check)s
             """ % locals(), file=sio)
 
@@ -1259,7 +1303,7 @@ class GpuCAReduceCuda(GpuKernelBase, HideC, CAReduceDtype):
                                 n_threads, numEls,
                                 PyGpuArray_NDIM(%(x)s));
             size_t n_shared = sizeof(%(acc_dtype)s) * n_threads;
-            int err = GpuKernel_call(&%(k_var)s, 1, &n_threads, &n_blocks, n_shared, kernel_params);
+            int err = GpuKernel_call(&%(k_var)s, 1, &n_blocks, &n_threads, n_shared, kernel_params);
             %(err_check)s
             %(sync)s
          }
@@ -1429,7 +1473,7 @@ class GpuCAReduceCuda(GpuKernelBase, HideC, CAReduceDtype):
                         (void *)%(z)s->ga.data,
                         (void *)&%(z)s->ga.offset,
                         (void *)&stride_Z0, (void *)&stride_Z1};
-                int err = GpuKernel_call(%(k_var)s, 3, n_threads, n_blocks, 0, kernel_params);
+                int err = GpuKernel_call(%(k_var)s, 3, n_blocks, n_threads, 0, kernel_params);
                 %(err_check)s
                 %(sync)s
         }else{
@@ -1458,7 +1502,7 @@ class GpuCAReduceCuda(GpuKernelBase, HideC, CAReduceDtype):
                     (void *)&stride_A0, (void *)&stride_A1, (void *)&stride_A2,
                     (void *)%(z)s->ga.data, (void *)&%(z)s->ga.offset,
                     (void *)&stride_Z0, (void *)&stride_Z1};
-            int err = GpuKernel_call(%(k_var)s, 3, n_threads, n_blocks, n_shared, kernel_params);
+            int err = GpuKernel_call(%(k_var)s, 3, n_blocks, n_threads, n_shared, kernel_params);
             %(err_check)s
             %(sync)s
         }
@@ -1533,7 +1577,7 @@ class GpuCAReduceCuda(GpuKernelBase, HideC, CAReduceDtype):
                         (void *)%(z)s->ga.data,
                         (void *)&%(z)s->ga.offset,
                         (void *)&stride_Z0, (void *)&stride_Z1};
-                int err = GpuKernel_call(&%(k_var)s, 3, n_threads, n_blocks, 0, kernel_params);
+                int err = GpuKernel_call(&%(k_var)s, 3, n_blocks, n_threads, 0, kernel_params);
                 %(err_check)s
                 %(sync)s
             }
@@ -1667,7 +1711,7 @@ class GpuCAReduceCuda(GpuKernelBase, HideC, CAReduceDtype):
                         (void *)%(z)s->ga.data,
                         (void *)&%(z)s->ga.offset,
                         (void *)&stride_Z0, (void *)&stride_Z1};
-                int err = GpuKernel_call(&%(k_var)s, 3, n_threads, n_blocks, 0, kernel_params);
+                int err = GpuKernel_call(&%(k_var)s, 3, n_blocks, n_threads, 0, kernel_params);
                 %(err_check)s
                 %(sync)s
             }
@@ -2587,6 +2631,63 @@ class GpuCAReduceCuda(GpuKernelBase, HideC, CAReduceDtype):
         return kernels
 
 
+class GpuErfinv(Erfinv):
+    """
+    Inverse error function for GPU.
+
+    """
+
+    def c_headers(self):
+        return ['math_functions.h', 'cublas_v2.h']
+
+    def c_code(self, node, name, inp, out, sub):
+        x, = inp
+        z, = out
+        if node.inputs[0].type in complex_types:
+            raise NotImplementedError('type not supported', type)
+        # NB: CUDA erfinv function (GPU op) returns NaN if x not in [-1;1],
+        # while `scipy.special.erfinv` (CPU op) returns an infinite (-inf if x < -1, +inf if x > 1).
+        # For consistency of CPU and GPU ops, we wrap the CUDA erfinv in the following conditions
+        # to ensure that GPU op returns the same values as CPU op.
+        return "%(z)s = (%(x)s <= -1) ? erfinv(-1.0): ((%(x)s >= 1) ? erfinv(1.0): erfinv(%(x)s));" % locals()
+
+
+class GpuErfcinv(Erfcinv):
+    """
+    Inverse complementary error function for GPU.
+
+    """
+
+    def c_headers(self):
+        return ['math_functions.h', 'cublas_v2.h']
+
+    def c_code(self, node, name, inp, out, sub):
+        x, = inp
+        z, = out
+        if node.inputs[0].type in complex_types:
+            raise NotImplementedError('type not supported', type)
+        # NB: CUDA erfcinv function (GPU op) returns NaN if x not in [0;2],
+        # while `scipy.special.erfcinv` (CPU op) returns an infinite (+inf if x < 0, -inf if x > 2).
+        # For consistency of CPU and GPU ops, we wrap the CUDA erfcinv in the following conditions
+        # to ensure that GPU op returns the same values as CPU op.
+        return "%(z)s = (%(x)s <= 0) ? erfcinv(0.0): ((%(x)s >= 2) ? erfcinv(2.0): erfcinv(%(x)s));" % locals()
+
+gpu_erfinv = GpuErfinv(upgrade_to_float_no_complex, name='gpu_erfinv')
+gpu_erfcinv = GpuErfcinv(upgrade_to_float_no_complex, name='gpu_erfcinv')
+
+
+# Caching GpuCAReduceCuda
+def gpu_ca_reduce_cuda(scalar_op, axis=None, reduce_mask=None, dtype=None, acc_dtype=None,
+                       pre_scalar_op=None):
+    key = (scalar_op, axis, reduce_mask, dtype, acc_dtype,
+           pre_scalar_op)
+    if key not in gpu_ca_reduce_cuda.cache:
+        gpu_ca_reduce_cuda.cache[key] = GpuCAReduceCuda(scalar_op, axis, reduce_mask, dtype,
+                                                        acc_dtype, pre_scalar_op)
+    return gpu_ca_reduce_cuda.cache[key]
+gpu_ca_reduce_cuda.cache = {}
+
+
 class GpuCAReduceCPY(GpuKernelBase, HideC, CAReduceDtype):
     """
     CAReduce that reuse the python code from gpuarray.
@@ -2625,11 +2726,9 @@ class GpuCAReduceCPY(GpuKernelBase, HideC, CAReduceDtype):
     def get_params(self, node):
         return node.outputs[0].type.context
 
-    def make_thunk(self, node, storage_map, compute_map, no_recycling):
+    def prepare_node(self, node, storage_map, compute_map, impl):
         # cache the kernel object
         self.get_kernel_cache(node)
-        return super(GpuCAReduceCPY, self).make_thunk(
-            node, storage_map, compute_map, no_recycling)
 
     def get_kernel_cache(self, node):
         attr = '@cache_reduction_k'
@@ -2799,7 +2898,7 @@ class GpuCAReduceCPY(GpuKernelBase, HideC, CAReduceDtype):
         if (gs == 0) gs = 1;
         n /= gs;
         ls = %(ls)s;
-        err = GpuKernel_call(&%(k_var)s, 1, &ls, &gs, 0, args);
+        err = GpuKernel_call(&%(k_var)s, 1, &gs, &ls, 0, args);
         if (err != GA_NO_ERROR) {
             PyErr_Format(PyExc_RuntimeError,
                          "gpuarray error: GpuCAReduceCPY: %%s.",
@@ -2835,8 +2934,8 @@ class GpuCAReduceCPY(GpuKernelBase, HideC, CAReduceDtype):
 
         return code
 
-    def c_code_cache_version(self):
-        return (2, self.GpuKernelBase_version)
+    def c_code_cache_version_apply(self, node):
+        return (2, self.kernel_version(node))
 
     def generate_kernel(self, node, odtype, redux):
         if isinstance(self.scalar_op, scalar.basic.Add):

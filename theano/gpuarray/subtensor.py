@@ -2,11 +2,13 @@ from __future__ import absolute_import, print_function, division
 
 import os
 
-import numpy
+import numpy as np
 from six import integer_types
 from six.moves import StringIO
 
 from theano import tensor, gof, Op
+from theano.gradient import grad_not_implemented
+import theano.tensor as T
 from theano.tensor.subtensor import IncSubtensor, Subtensor, get_idx_list
 
 try:
@@ -17,7 +19,7 @@ except ImportError:
 
 from .type import GpuArrayType, gpu_context_type
 from .basic_ops import (as_gpuarray_variable, HideC, GpuKernelBase, Kernel,
-                        infer_context_name)
+                        infer_context_name, gpu_contiguous)
 
 
 iadd_reg = {}
@@ -126,7 +128,7 @@ class GpuSubtensor(HideC, Subtensor):
         def fix_idx(idx):
             if idx is None:
                 return "0", 1
-            elif isinstance(idx, (numpy.integer, integer_types)):
+            elif isinstance(idx, (np.integer, integer_types)):
                 return str(idx), 0
             elif isinstance(idx, gof.Type):
                 return indices.pop(0), 0
@@ -153,7 +155,7 @@ class GpuSubtensor(HideC, Subtensor):
             else:
                 if isinstance(idx, gof.Type):
                     start = indices.pop(0)
-                elif isinstance(idx, (numpy.integer, integer_types)):
+                elif isinstance(idx, (np.integer, integer_types)):
                     start = idx
                 else:
                     assert 0, idx
@@ -336,11 +338,22 @@ class GpuIncSubtensor(IncSubtensor):
             C code expression to copy source into view, and 0 on success.
 
         """
-        return """GpuArray_setarray(&%(view)s->ga, &%(source)s->ga)""" % locals()
+        return """sub_setarray(&%(view)s->ga, &%(source)s->ga)""" % locals()
 
     def c_headers(self):
         return ['<numpy_compat.h>', '<gpuarray/error.h>', '<gpuarray/array.h>',
                 '<gpuarray/elemwise.h>']
+
+    def c_support_code(self):
+        return """
+int sub_setarray(GpuArray *dst, GpuArray *src) {
+  int err;
+  err = GpuArray_setarray(dst, src);
+  if (err != GA_NO_ERROR)
+    PyErr_SetString(PyExc_RuntimeError, "setarray failed");
+  return err;
+}
+"""
 
     def c_support_code_struct(self, node, nodename):
         return "\nGpuElemwise *iadd;\n"
@@ -383,7 +396,7 @@ class GpuIncSubtensor(IncSubtensor):
         parent_version = super(GpuIncSubtensor, self).c_code_cache_version()
         if not parent_version:
             return
-        return parent_version + (7,)
+        return parent_version + (8,)
 
 
 class GpuAdvancedSubtensor1(HideC, tensor.AdvancedSubtensor1):
@@ -395,12 +408,12 @@ class GpuAdvancedSubtensor1(HideC, tensor.AdvancedSubtensor1):
         x_ = as_gpuarray_variable(x, ctx_name)
 
         ilist__ = tensor.as_tensor_variable(ilist)
-        if ilist__.type.dtype[:3] not in ('int', 'uin'):
+        if ilist__.type.dtype not in tensor.integer_dtypes:
             raise TypeError('index must be integers')
         if ilist__.type.dtype != 'int64':
             ilist__ = tensor.cast(ilist__, 'int64')
 
-        ilist_ = as_gpuarray_variable(ilist__, ctx_name)
+        ilist_ = gpu_contiguous(as_gpuarray_variable(ilist__, ctx_name))
 
         if ilist_.type.dtype != 'int64':
             raise TypeError('index must be int64')
@@ -461,6 +474,107 @@ if (err != GA_NO_ERROR) {
         return (0,)
 
 
+class GpuAdvancedSubtensor(HideC, tensor.AdvancedSubtensor):
+    """
+    AdvancedSubtensor On the GPU.
+    """
+    def make_node(self, x, *inputs):
+        ctx_name = infer_context_name(x)
+        rval = tensor.AdvancedSubtensor.make_node(self, x, *inputs)
+        otype = GpuArrayType(dtype=rval.outputs[0].type.dtype,
+                             broadcastable=rval.outputs[0].type.broadcastable,
+                             context_name=ctx_name)
+        x = as_gpuarray_variable(x, ctx_name)
+        return gof.Apply(self, [x] + rval.inputs[1:], [otype()])
+
+    def perform(self, node, inputs, out_):
+        out, = out_
+        x = inputs[0]
+        idx = inputs[1:]
+
+        # detect and transpose array indices
+        nidx = []
+        nshp = list(x.shape)
+        for k, i in enumerate(idx):
+            if i is None:
+                nidx.append(slice(None))
+                nshp.insert(k, 1)
+            else:
+                nidx.append(i)
+
+        x = x.reshape(nshp)
+
+        narrays = 0
+        transp = list(range(x.ndim))
+        p = 0
+        # ap gives the position of the array in case there is only one.
+        # if there are more than one (narray > 1) it should be ignored.
+        ap = 0
+        for k, i in enumerate(list(nidx)):
+            if (isinstance(i, np.ndarray) and
+                    i.ndim != 0):
+                transp.remove(k)
+                transp.insert(p, k)
+                ap += k
+                i = nidx.pop(k)
+                nidx.insert(p, i)
+                p += 1
+                narrays += 1
+            else:
+                if narrays == 0:
+                    try:
+                        i.__index__()
+                        # We shift back the position of the array by the
+                        # number of dimensions that are removed by
+                        # indexing.  If ap is bigger than 0 it means we
+                        # have encountered at least one array.
+                        if ap >= 0:
+                            ap -= 1
+                        # If this index is before the first array then
+                        # we will not move the array back to its
+                        # position.  Mark this by faking that there
+                        # are more than two arrays.  This is crazy
+                        # numpy behaviour so blame them.
+                        narrays = 2
+                    except Exception:
+                        pass
+
+        x = x.transpose(*transp)
+
+        idx_ = ([slice(None)] * p + nidx[p:])
+        x = x.__getitem__(idx_)
+
+        # flatten the array-indexed dimensions
+        shape = ((np.prod(x.shape[0: p]),) +
+                 x.shape[p:])
+        input_flat = x.reshape(shape)
+
+        # build the strides
+        strides = [1]
+        for i in range(p - 1, 0, -1):
+            stride = x.shape[i] * strides[-1]
+            strides.insert(0, stride)
+
+        # build the indices and use it
+        take_idx = sum((i * s for i, s in zip(nidx, strides)))
+        out_flat = input_flat.take1(pygpu.asarray(take_idx.flatten(),
+                                                  context=x.context))
+
+        # finish up
+        out_flat_shp = take_idx.shape + x.shape[p:]
+        o = out_flat.reshape(out_flat_shp)
+
+        # If there was only one array we need to move the indexed
+        # dimension(s) back to the position of the array, which is
+        # stored in ap.  Note that ap is invalid is narrays != 1.
+        if narrays == 1:
+            ntransp = list(range(take_idx.ndim, o.ndim))
+            ntransp[ap:ap] = list(range(take_idx.ndim))
+            o = o.transpose(*ntransp)
+
+        out[0] = o
+
+
 class GpuAdvancedIncSubtensor1(Op):
     """
     Implement AdvancedIncSubtensor1 on the gpu.
@@ -487,10 +601,9 @@ class GpuAdvancedIncSubtensor1(Op):
         y_ = as_gpuarray_variable(y, ctx_name)
         ilist_ = tensor.as_tensor_variable(ilist)
 
-        assert x_.type.dtype == y_.type.dtype
         assert x_.type.ndim >= y_.type.ndim
 
-        if ilist_.type.dtype[:3] not in ('int', 'uin'):
+        if ilist_.type.dtype not in tensor.integer_dtypes:
             raise TypeError('index must be integers')
         if ilist_.type.ndim != 1:
             raise TypeError('index must be vector')
@@ -531,7 +644,7 @@ class GpuAdvancedIncSubtensor1(Op):
         # content to index x and y (This is because we serve as
         # fallback for _dev20).
         if isinstance(idx, gpuarray.GpuArray):
-            idx = numpy.asarray(idx)
+            idx = np.asarray(idx)
 
         # If `y` has as many dimensions as `x`, then we want to iterate
         # jointly on `x` and `y`. Otherwise, it means `y` should be
@@ -690,10 +803,9 @@ class GpuAdvancedIncSubtensor1_dev20(GpuKernelBase, HideC,
         y_ = as_gpuarray_variable(y, ctx_name)
         ilist_ = as_gpuarray_variable(ilist, ctx_name)
 
-        assert x_.type.dtype == y_.type.dtype
         assert x_.type.ndim >= y_.type.ndim
 
-        if ilist_.type.dtype[:3] not in ('int', 'uin'):
+        if ilist_.type.dtype not in tensor.integer_dtypes:
             raise TypeError('index must be integers')
         if ilist_.type.ndim != 1:
             raise TypeError('index must be vector')
@@ -765,10 +877,10 @@ if (GpuArray_vector_add_fast(%(out)s, %(y)s, %(ind)s, %(set_instead_of_inc)s)) {
         dtype_y = node.inputs[1].dtype
         dtype_ind = node.inputs[2].dtype
         dtype_out = node.outputs[0].dtype
-        itemsize_x = numpy.dtype(dtype_x).itemsize
-        itemsize_y = numpy.dtype(dtype_y).itemsize
-        itemsize_ind = numpy.dtype(dtype_ind).itemsize
-        itemsize_out = numpy.dtype(dtype_out).itemsize
+        itemsize_x = np.dtype(dtype_x).itemsize
+        itemsize_y = np.dtype(dtype_y).itemsize
+        itemsize_ind = np.dtype(dtype_ind).itemsize
+        itemsize_out = np.dtype(dtype_out).itemsize
         flags = Kernel.get_flags(dtype_x, dtype_y, dtype_ind)
         type_x = gpuarray.dtype_to_ctype(dtype_x)
         type_y = gpuarray.dtype_to_ctype(dtype_y)
@@ -895,10 +1007,10 @@ __device__ ga_half atomicExch(ga_half *addr, ga_half val) {
         dtype_y = node.inputs[1].dtype
         dtype_ind = node.inputs[2].dtype
         dtype_out = node.outputs[0].dtype
-        itemsize_x = numpy.dtype(dtype_x).itemsize
-        itemsize_y = numpy.dtype(dtype_y).itemsize
-        itemsize_ind = numpy.dtype(dtype_ind).itemsize
-        itemsize_out = numpy.dtype(dtype_out).itemsize
+        itemsize_x = np.dtype(dtype_x).itemsize
+        itemsize_y = np.dtype(dtype_y).itemsize
+        itemsize_ind = np.dtype(dtype_ind).itemsize
+        itemsize_out = np.dtype(dtype_out).itemsize
         k_var = "k_vector_add_fast_" + nodename
 
         return super(GpuAdvancedIncSubtensor1_dev20, self).c_support_code_struct(node, nodename) + """
@@ -943,7 +1055,7 @@ __device__ ga_half atomicExch(ga_half *addr, ga_half val) {
                                        (void *)&indices_arr->ga.offset,
                                        (void *)&set_instead_of_inc,
                                        (void *)errbuf};
-              err = GpuKernel_call(&%(k_var)s, 3, threads_per_block, n_blocks, 0, kernel_params);
+              err = GpuKernel_call(&%(k_var)s, 3, n_blocks, threads_per_block, 0, kernel_params);
               if (err != GA_NO_ERROR) {
                 PyErr_Format(PyExc_RuntimeError,
                              "gpuarray error: %(k_var)s: %%s.",
@@ -965,3 +1077,108 @@ __device__ ga_half atomicExch(ga_half *addr, ga_half val) {
           return 0;
         }
         """ % locals()
+
+
+class GpuDiagonal(Subtensor):
+    __props__ = ("offset", "axis1", "axis2", "view")
+
+    def __init__(self, offset=0, axis1=0, axis2=1, view=False):
+        self.view = view
+        if self.view:
+            self.view_map = {0: [0]}
+        self.offset = offset
+        self.axis1 = axis1
+        self.axis2 = axis2
+
+    def make_node(self, _x):
+        ctx_name = infer_context_name(_x)
+        x = as_gpuarray_variable(_x, ctx_name)
+
+        if x.ndim < 2:
+            raise ValueError('Diagonal needs an input with 2 or more '
+                             'dimensions', x)
+        axis_small, axis_large = sorted((self.axis1, self.axis2))
+        broadcastable = x.broadcastable[:axis_small] + \
+            x.broadcastable[axis_small + 1:axis_large] + \
+            x.broadcastable[axis_large + 1:] + (False,)
+        return gof.Apply(self, [x], [x.type.__class__(
+            dtype=x.dtype,
+            broadcastable=broadcastable)()])
+
+    def perform(self, node, inputs, outputs):
+        (x,) = inputs
+        (z,) = outputs
+        # zero-dimensional matrices ...
+        if x.size == 0:
+            out_shape = [d for i, d in enumerate(x.shape)
+                         if i not in (self.axis1, self.axis2)]
+            diag_size = np.min((x.shape[self.axis1], x.shape[self.axis2]))
+            out_shape.append(diag_size)
+            z[0] = node.outputs[0].type.value_zeros(tuple(out_shape))
+            return
+
+        # step 1) slicing on axis1 and axis2.
+        if self.offset >= 0:
+            stride_axis, slice_axis = self.axis1, self.axis2
+        else:
+            slice_axis, stride_axis = self.axis1, self.axis2
+
+        small_axis, large_axis = sorted((x.shape[self.axis1],
+                                         x.shape[self.axis2]))
+
+        if x.shape[stride_axis] < x.shape[slice_axis]:
+            # in the bigger triangle
+            numstride = small_axis - np.max((
+                0, small_axis + np.abs(self.offset) - large_axis))
+        else:
+            # in the smaller triangle
+            numstride = small_axis - np.abs(self.offset)
+
+        slicer = [np.s_[:], ] * x.ndim
+        slicer[stride_axis] = np.s_[:numstride]
+        slicer[slice_axis] = np.abs(self.offset)
+        slicer = tuple(slicer)
+
+        # step 2) Swap stride_axis to the last dim because we want the dim on
+        # which the diags extracted be listed as the last dim of the tensor.
+        # This is also in consistence with the interface of numpy.diagonal.
+        if slice_axis < stride_axis:
+            stride_axis -= 1
+        new_dim_order = range(x[slicer].ndim)
+        new_dim_order = tuple(new_dim_order[:stride_axis] +
+                              new_dim_order[stride_axis + 1:] +
+                              [stride_axis, ])
+        rval = x[slicer].transpose(new_dim_order)
+
+        # step 3) modify the strides in the last axis, such that rval becomes
+        # a view on the diagonal.
+        other_strides = tuple([d for i, d in enumerate(x.strides)
+                               if i not in (self.axis1, self.axis2)])
+        rval.strides = other_strides + \
+            (x.strides[self.axis1] + x.strides[self.axis2], )
+
+        if self.view:
+            z[0] = rval
+        else:
+            z[0] = rval.copy()
+
+    def grad(self, inputs, gout):
+        (input_x,) = inputs
+        return [grad_not_implemented(self, 0, input_x)]
+
+    def infer_shape(self, node, shapes):
+        in_shape, = shapes
+        dim1 = in_shape[self.axis1]
+        dim2 = in_shape[self.axis2]
+        out_shape = [d for i, d in enumerate(in_shape)
+                     if i not in (self.axis1, self.axis2)]
+        # The following logic is inspired by C code of PyArray_Diagonal().
+        offset = self.offset
+        if offset > 0:
+            diag_size = T.clip(dim2 - offset, 0, dim1)
+        elif offset < 0:
+            diag_size = T.clip(dim1 + offset, 0, dim2)
+        else:
+            diag_size = T.minimum(dim1, dim2)
+        out_shape.append(diag_size)
+        return [tuple(out_shape)]

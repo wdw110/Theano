@@ -35,15 +35,21 @@ if (APPLY_SPECIFIC(output) != NULL)
 
 int APPLY_SPECIFIC(softmax)(PyGpuArrayObject *x,
                             PyGpuArrayObject **out,
-                            PyGpuContextObject *c) {
+                            cudnnHandle_t _handle) {
+  PyGpuContextObject *c = x->context;
   cudnnStatus_t err;
-
-  if (c_set_tensorNd(x, APPLY_SPECIFIC(input)) != 0)
-    return 1;
 
   if (theano_prep_output(out, PyGpuArray_NDIM(x),
                          PyGpuArray_DIMS(x), x->ga.typecode,
                          GA_C_ORDER, c) != 0)
+    return 1;
+
+  // Directly return the output if any of the dimensions is 0.
+  // (cuDNN does not support zero-length dimensions.)
+  if (PyGpuArray_SIZE(*out) == 0)
+    return 0;
+
+  if (c_set_tensorNd(x, APPLY_SPECIFIC(input)) != 0)
     return 1;
 
   if (c_set_tensorNd(*out, APPLY_SPECIFIC(output)) != 0)
@@ -77,7 +83,7 @@ int APPLY_SPECIFIC(softmax)(PyGpuArrayObject *x,
     cuda_wait((*out)->ga.data, GPUARRAY_CUDA_WAIT_WRITE);
 
     err = cudnnSoftmaxForward(
-      APPLY_SPECIFIC(_handle),
+      _handle,
       SOFTMAX_ALGO,
       SOFTMAX_MODE,
       alpha,
